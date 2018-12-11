@@ -1,0 +1,756 @@
+#+STARTUP: indent
+
+* REPL代码
+REPL系统挂接到串口 1 上，允许通过命令对系统进行操作，比如查看参数，开
+锁，关锁等。
+** 基本框架
+#+begin_src c :tangle /dev/shm/upgrade/repl.h
+  #ifndef __REPL_H
+  #define __REPL_H
+
+  #include "uart.h"
+  #include "ring.h"
+  #include "utility.h"
+
+  #define repl_leading() do {                     \
+      output_string("> ");                        \
+    } while(0)
+
+  extern struct uart_context_t repl_uart_context;
+
+  extern struct ring_t repl_tx;
+  extern struct ring_t repl_rx;
+  extern uint8_t debug;
+
+  void repl_setup(struct uart_context_t * ctx);
+  void repl_eventloop(struct uart_context_t * ctx, uint8_t * buffer, uint32_t bufsize);
+  <<repl-output-string-prototype>>
+  <<repl-output-char-prototype>>
+  <<repl-output-byte-prototype>>
+  <<repl-output-uint32-prototype>>
+  <<repl-output-newline-prototype>>
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/upgrade/repl.c
+  #include <stdint.h>
+  #include <stddef.h>
+  #include <string.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/usart.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include "repl.h"
+  #include "stack.h"
+  #include "w25x16.h"
+  #include "uart.h"
+  #include "repl-fsm.h"
+  #include "repl-lex-fsm.h"
+  #include "utility.h"
+  #include "led.h"
+
+  #define REPL_BUFFER_BITSIZE 14
+  #define REPL_STACK_BUFFER_BITSIZE 6
+
+  <<repl-lex-context>>
+  uint8_t debug = 0;
+  struct ring_t repl_tx, repl_rx;
+  static struct repl_lex_context_t repl_lex_context;
+  static uint32_t repl_state, repl_lex_state;
+  struct uart_context_t repl_uart_context;
+  static struct stack_t repl_stack;
+
+  static uint8_t repl_tx_buffer[2 << (REPL_BUFFER_BITSIZE - 1)];
+  static uint8_t repl_rx_buffer[2 << (REPL_BUFFER_BITSIZE - 1)];
+  static uint8_t repl_stack_buffer[2 << (REPL_STACK_BUFFER_BITSIZE - 1)];
+
+  <<repl-erase-usage>>
+  <<repl-write-usage>>
+  <<repl-read-usage>>
+  <<repl-dump-usage>>
+  <<repl-status-usage>>
+  <<repl-program-usage>>
+  <<repl-help>>
+  <<repl-erase-sector>>
+  <<repl-erase-block>>
+  <<repl-erase-chip>>
+  <<repl-write>>
+  <<repl-program>>
+  <<repl-read>>
+  <<repl-dump>>
+  <<repl-status>>
+  <<repl-fsm-action>>
+  <<repl-lex-fsm-action>>
+
+  <<repl-setup>>
+  <<repl-eventloop>>
+  <<repl-output-string>>
+  <<repl-output-char>>
+  <<repl-output-byte>>
+  <<repl-output-uint32>>
+  <<repl-output-newline>>
+#+end_src
+** 配置
+#+begin_src c :noweb-ref repl-setup
+  void repl_setup(struct uart_context_t * ctx) {
+    ring_init(&repl_tx, repl_tx_buffer, REPL_BUFFER_BITSIZE);
+    ring_init(&repl_rx, repl_rx_buffer, REPL_BUFFER_BITSIZE);
+    stack_init(&repl_stack, repl_stack_buffer, REPL_STACK_BUFFER_BITSIZE);
+    ctx->tx = &repl_tx;
+    ctx->rx = &repl_rx;
+    ctx->baudrate = 115200;
+    ctx->databits = 8;
+    ctx->stopbits = 1;
+    ctx->tx_interval = 1; // 1ms
+    ctx->loop_interval = 9; // 10ms
+    bzero(&repl_lex_context, sizeof(struct repl_lex_context_t));
+    repl_state = REPL_READY_STATE;
+    repl_lex_state = REPL_LEX_READY_STATE;
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref repl-eventloop
+  void repl_eventloop(struct uart_context_t * ctx, uint8_t * buffer, uint32_t bufsize) {
+    uint32_t rxlen = ring_length(ctx->rx);
+    if (rxlen > 0) {
+      //led_off();
+      for (uint32_t i = 0; i < rxlen; i ++) {
+        uint8_t byte;
+        ring_read(ctx->rx, &byte);
+        repl_lex_context.byte = byte;
+        if ('a' == byte) {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_A_EVENT, &repl_lex_context);
+        } else if ('b' == byte) {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_B_EVENT, &repl_lex_context);
+        } else if ('c' == byte) {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_C_EVENT, &repl_lex_context);
+        } else if ('d' == byte) {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_D_EVENT, &repl_lex_context);
+        } else if ('e' == byte) {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_E_EVENT, &repl_lex_context);
+        } else if ('f' == byte) {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_F_EVENT, &repl_lex_context);
+        } else if ('g' <= byte && byte <= 'w') {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_CHAR_EVENT, &repl_lex_context);
+        } else if ('x' == byte) {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_X_EVENT, &repl_lex_context);
+        } else if ('y' <= byte && byte <= 'z') {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_CHAR_EVENT, &repl_lex_context);
+        } else if ('A' <= byte && byte <= 'Z') {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_CHAR_EVENT, &repl_lex_context);
+        } else if ('0' == byte) {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_0_EVENT, &repl_lex_context);
+        } else if ('1' <= byte && byte <= '9') {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_DIGITIAL_EVENT, &repl_lex_context);
+        } else if (byte == '\r') {
+          output_char(byte);
+          output_char('\n');
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_CR_EVENT, &repl_lex_context);
+        } else if (byte == '\n') {
+          output_char('\r');
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_CR_EVENT, &repl_lex_context);
+        } else if (byte == '\t') {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_TAB_EVENT, &repl_lex_context);
+        } else if (byte == '\b' || byte == 127) {
+          if (repl_lex_context.ptr == 0) {
+            continue;
+          }
+          output_char('\b');
+          if (repl_lex_context.ptr == 3) {
+            repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_BS_COMMA_LEN_EQUALS_3_EVENT, &repl_lex_context);
+          } else {
+            repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_BS_COMMA_LEN_GREATER_THAN_3_EVENT, &repl_lex_context);
+          }
+        } else if (byte == ' ') {
+          output_char(byte);
+          repl_lex_state = repl_lex_transform_state(repl_lex_state, REPL_LEX_SPACE_EVENT, &repl_lex_context);
+        }
+      }
+    } else {
+      //led_on();
+    }
+  }
+#+end_src
+** 交互状态机
+交互状态机用于解析从上位机发送来的数据。交互状态机的定义见
+repl-fsm.xlsx 文件。
+
+#+begin_src c :noweb-ref repl-fsm-action
+  void repl_do_action(enum REPL_ACTION action, void * data) {
+    switch (action) {
+    case REPL_LEADING_ACTION:
+      repl_leading();
+      break;
+    case REPL_HELP_ACTION:
+    case REPL_HELP_COMMA_LEADING_ACTION:
+      stack_clear(&repl_stack);
+      repl_help();
+      if (action == REPL_HELP_COMMA_LEADING_ACTION) {
+        repl_leading();
+      }
+      break;
+    case REPL_ERASE_USAGE_ACTION:
+      stack_clear(&repl_stack);
+      repl_erase_usage();
+      repl_leading();
+      break;
+    case REPL_NUMBER_ACTION:
+      stack_push(&repl_stack, * (uint8_t *) data);
+      break;
+    case REPL_APPEND_ACTION: {
+      char * token = (char *) data;
+      uint8_t len = 0;
+      while (token[len] != 0) len ++;
+      for (uint32_t i = len - 1; i != 0xFFFFFFFF; i --) {
+        stack_push(&repl_stack, token[i]);
+      }
+      stack_push(&repl_stack, len);
+      break;
+    }
+    case REPL_ERASE_SECTOR_ACTION: {
+      uint8_t byte0 = 0;
+      uint8_t byte1 = 0;
+      uint8_t byte2 = 0;
+      uint8_t byte3 = 0;
+      stack_top(&repl_stack, &byte0);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte1);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte2);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte3);
+      stack_pop(&repl_stack);
+      uint32_t addr = (((uint32_t) byte3) << 24) | (((uint32_t) byte2) << 16) | (((uint32_t) byte1) << 8) | byte0;
+      repl_erase_sector(addr);
+      repl_leading();
+      break;
+    }
+    case REPL_ERASE_BLOCK_ACTION: {
+      uint8_t byte0 = 0;
+      uint8_t byte1 = 0;
+      uint8_t byte2 = 0;
+      uint8_t byte3 = 0;
+      stack_top(&repl_stack, &byte0);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte1);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte2);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte3);
+      stack_pop(&repl_stack);
+      uint32_t addr = (((uint32_t) byte3) << 24) | (((uint32_t) byte2) << 16) | (((uint32_t) byte1) << 8) | byte0;
+      repl_erase_block(addr);
+      repl_leading();
+      break;
+    }
+    case REPL_ERASE_CHIP_ACTION: {
+      repl_erase_chip();
+      repl_leading();
+      break;
+    }
+    case REPL_WRITE_USAGE_ACTION:
+      repl_write_usage();
+      repl_leading();
+      break;
+    case REPL_WRITE_ENABLE_ACTION:
+      repl_write(1);
+      repl_leading();
+      break;
+    case REPL_WRITE_DISABLE_ACTION:
+      repl_write(0);
+      repl_leading();
+      break;
+    case REPL_DUMP_USAGE_ACTION:
+      repl_dump_usage();
+      repl_leading();
+      break;
+    case REPL_DUMP_ACTION: {
+      uint8_t byte0 = 0;
+      uint8_t byte1 = 0;
+      uint8_t byte2 = 0;
+      uint8_t byte3 = 0;
+      stack_top(&repl_stack, &byte0);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte1);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte2);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte3);
+      stack_pop(&repl_stack);
+      uint32_t addr = (((uint32_t) byte3) << 24) | (((uint32_t) byte2) << 16) | (((uint32_t) byte1) << 8) | byte0;
+      repl_dump(addr);
+      repl_leading();
+      break;
+    }
+    case REPL_PROGRAM_USAGE_ACTION:
+      stack_clear(&repl_stack);
+      repl_program_usage();
+      repl_leading();
+      break;
+    case REPL_PROGRAM_ACTION: {
+      uint8_t len = 0;
+      stack_top(&repl_stack, &len);
+      stack_pop(&repl_stack);
+      uint8_t buf[len];
+      for (uint8_t i = 0; i < len; i ++) {
+        stack_top(&repl_stack, &buf[i]);
+        stack_pop(&repl_stack);
+      }
+      uint8_t byte0 = 0;
+      uint8_t byte1 = 0;
+      uint8_t byte2 = 0;
+      uint8_t byte3 = 0;
+      stack_top(&repl_stack, &byte0);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte1);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte2);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte3);
+      stack_pop(&repl_stack);
+      uint32_t addr = (((uint32_t) byte3) << 24) | (((uint32_t) byte2) << 16) | (((uint32_t) byte1) << 8) | byte0;
+      repl_program(addr, buf, len);
+      repl_leading();
+      break;
+    }
+    case REPL_READ_USAGE_ACTION:
+      stack_clear(&repl_stack);
+      repl_read_usage();
+      repl_leading();
+      break;
+    case REPL_READ_ACTION: {
+      uint8_t len = 0;
+      stack_top(&repl_stack, &len);
+      stack_pop(&repl_stack);
+      uint8_t byte0 = 0;
+      uint8_t byte1 = 0;
+      uint8_t byte2 = 0;
+      uint8_t byte3 = 0;
+      stack_top(&repl_stack, &byte0);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte1);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte2);
+      stack_pop(&repl_stack);
+      stack_top(&repl_stack, &byte3);
+      stack_pop(&repl_stack);
+      uint32_t addr = (((uint32_t) byte3) << 24) | (((uint32_t) byte2) << 16) | (((uint32_t) byte1) << 8) | byte0;
+      repl_read(addr, len);
+      repl_leading();
+      break;
+    }
+    case REPL_STATUS_USAGE_ACTION:
+      stack_clear(&repl_stack);
+      repl_status_usage();
+      repl_leading();
+      break;
+    case REPL_STATUS_ACTION:
+      repl_status();
+      repl_leading();
+      break;
+    }
+  }
+#+end_src
+** 词法解析状态机
+词法解析状态机见 repl-lex-fsm.xlsx。
+#+begin_src c :noweb-ref repl-lex-fsm-action
+  void repl_lex_do_action(enum REPL_LEX_ACTION action, void * data) {
+    struct repl_lex_context_t * ctx = (struct repl_lex_context_t *) data;
+    switch (action) {
+    case REPL_LEX_CR_ACTION:
+      repl_state = repl_transform_state(repl_state, REPL_CR_EVENT, NULL);
+      break;
+    case REPL_LEX_APPEND_ACTION:
+      ctx->buf[ctx->ptr ++] = ctx->byte;
+      break;
+    case REPL_LEX_BACKSPACE_ACTION:
+      if (ctx->ptr != 0) {
+        ctx->ptr --;
+      }
+      break;
+    case REPL_LEX_TOKEN_ACTION:
+    case REPL_LEX_TOKEN_AND_CR_ACTION:
+      if (ctx->ptr == 4 &&
+          (ctx->buf[0] == 'H' || ctx->buf[0] == 'h') &&
+          (ctx->buf[1] == 'E' || ctx->buf[1] == 'e') &&
+          (ctx->buf[2] == 'L' || ctx->buf[2] == 'l') &&
+          (ctx->buf[3] == 'P' || ctx->buf[3] == 'p')) {
+        repl_state = repl_transform_state(repl_state, REPL_HELP_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+          (ctx->buf[0] == 'R' || ctx->buf[0] == 'r') &&
+          (ctx->buf[1] == 'E' || ctx->buf[1] == 'e') &&
+          (ctx->buf[2] == 'A' || ctx->buf[2] == 'a') &&
+          (ctx->buf[3] == 'D' || ctx->buf[3] == 'd')) {
+        repl_state = repl_transform_state(repl_state, REPL_READ_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+          (ctx->buf[0] == 'W' || ctx->buf[0] == 'w') &&
+          (ctx->buf[1] == 'R' || ctx->buf[1] == 'r') &&
+          (ctx->buf[2] == 'I' || ctx->buf[2] == 'i') &&
+          (ctx->buf[3] == 'T' || ctx->buf[3] == 't') &&
+          (ctx->buf[4] == 'E' || ctx->buf[4] == 'e')) {
+        repl_state = repl_transform_state(repl_state, REPL_WRITE_EVENT, NULL);
+      } else if (ctx->ptr == 6 &&
+          (ctx->buf[0] == 'E' || ctx->buf[0] == 'e') &&
+          (ctx->buf[1] == 'N' || ctx->buf[1] == 'n') &&
+          (ctx->buf[2] == 'A' || ctx->buf[2] == 'a') &&
+          (ctx->buf[3] == 'B' || ctx->buf[3] == 'b') &&
+          (ctx->buf[4] == 'L' || ctx->buf[4] == 'l') &&
+          (ctx->buf[5] == 'E' || ctx->buf[5] == 'e')) {
+        repl_state = repl_transform_state(repl_state, REPL_ENABLE_EVENT, NULL);
+      } else if (ctx->ptr == 7 &&
+          (ctx->buf[0] == 'D' || ctx->buf[0] == 'd') &&
+          (ctx->buf[1] == 'I' || ctx->buf[1] == 'i') &&
+          (ctx->buf[2] == 'S' || ctx->buf[2] == 's') &&
+          (ctx->buf[3] == 'A' || ctx->buf[3] == 'a') &&
+          (ctx->buf[4] == 'B' || ctx->buf[4] == 'b') &&
+          (ctx->buf[5] == 'L' || ctx->buf[5] == 'l') &&
+          (ctx->buf[6] == 'E' || ctx->buf[6] == 'e')) {
+        repl_state = repl_transform_state(repl_state, REPL_DISABLE_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+          (ctx->buf[0] == 'E' || ctx->buf[0] == 'e') &&
+          (ctx->buf[1] == 'R' || ctx->buf[1] == 'r') &&
+          (ctx->buf[2] == 'A' || ctx->buf[2] == 'a') &&
+          (ctx->buf[3] == 'S' || ctx->buf[3] == 's') &&
+          (ctx->buf[4] == 'E' || ctx->buf[4] == 'e')) {
+        repl_state = repl_transform_state(repl_state, REPL_ERASE_EVENT, NULL);
+      } else if (ctx->ptr == 6 &&
+          (ctx->buf[0] == 'S' || ctx->buf[0] == 's') &&
+          (ctx->buf[1] == 'E' || ctx->buf[1] == 'e') &&
+          (ctx->buf[2] == 'C' || ctx->buf[2] == 'c') &&
+          (ctx->buf[3] == 'T' || ctx->buf[3] == 't') &&
+          (ctx->buf[4] == 'O' || ctx->buf[4] == 'o') &&
+          (ctx->buf[5] == 'R' || ctx->buf[5] == 'r')) {
+        repl_state = repl_transform_state(repl_state, REPL_SECTOR_EVENT, NULL);
+      } else if (ctx->ptr == 5 &&
+          (ctx->buf[0] == 'B' || ctx->buf[0] == 'b') &&
+          (ctx->buf[1] == 'L' || ctx->buf[1] == 'l') &&
+          (ctx->buf[2] == 'O' || ctx->buf[2] == 'o') &&
+          (ctx->buf[2] == 'C' || ctx->buf[2] == 'c') &&
+          (ctx->buf[3] == 'K' || ctx->buf[3] == 'k')) {
+        repl_state = repl_transform_state(repl_state, REPL_BLOCK_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+          (ctx->buf[0] == 'C' || ctx->buf[0] == 'c') &&
+          (ctx->buf[1] == 'H' || ctx->buf[1] == 'h') &&
+          (ctx->buf[2] == 'I' || ctx->buf[2] == 'i') &&
+          (ctx->buf[3] == 'P' || ctx->buf[3] == 'p')) {
+        repl_state = repl_transform_state(repl_state, REPL_CHIP_EVENT, NULL);
+      } else if (ctx->ptr == 4 &&
+          (ctx->buf[0] == 'D' || ctx->buf[0] == 'd') &&
+          (ctx->buf[1] == 'U' || ctx->buf[1] == 'u') &&
+          (ctx->buf[2] == 'M' || ctx->buf[2] == 'm') &&
+          (ctx->buf[3] == 'P' || ctx->buf[3] == 'p')) {
+        repl_state = repl_transform_state(repl_state, REPL_DUMP_EVENT, NULL);
+      } else if (ctx->ptr == 7 &&
+          (ctx->buf[0] == 'P' || ctx->buf[0] == 'p') &&
+          (ctx->buf[1] == 'R' || ctx->buf[1] == 'r') &&
+          (ctx->buf[2] == 'O' || ctx->buf[2] == 'o') &&
+          (ctx->buf[3] == 'G' || ctx->buf[3] == 'g') &&
+          (ctx->buf[4] == 'R' || ctx->buf[4] == 'r') &&
+          (ctx->buf[5] == 'A' || ctx->buf[5] == 'a') &&
+          (ctx->buf[6] == 'M' || ctx->buf[6] == 'm')) {
+        repl_state = repl_transform_state(repl_state, REPL_PROGRAM_EVENT, NULL);
+      } else if (ctx->ptr == 6 &&
+          (ctx->buf[0] == 'S' || ctx->buf[0] == 's') &&
+          (ctx->buf[1] == 'T' || ctx->buf[1] == 't') &&
+          (ctx->buf[2] == 'A' || ctx->buf[2] == 'a') &&
+          (ctx->buf[3] == 'T' || ctx->buf[3] == 't') &&
+          (ctx->buf[4] == 'U' || ctx->buf[4] == 'u') &&
+          (ctx->buf[5] == 'S' || ctx->buf[5] == 's')) {
+        repl_state = repl_transform_state(repl_state, REPL_STATUS_EVENT, NULL);
+      } else {
+        ctx->buf[ctx->ptr] = 0;
+        repl_state = repl_transform_state(repl_state, REPL_OTHERS_EVENT, ctx->buf);
+      }
+      ctx->ptr = 0;
+      if (action == REPL_LEX_TOKEN_AND_CR_ACTION) {
+        repl_state = repl_transform_state(repl_state, REPL_CR_EVENT, NULL);
+      }
+      break;
+    case REPL_LEX_NUMBER_ACTION:
+    case REPL_LEX_NUMBER_AND_CR_ACTION:
+    case REPL_LEX_NUMBER_AND_APPEND_ACTION: {
+      uint32_t num = string_to_uint((char *)ctx->buf, ctx->ptr);
+      ctx->ptr = 0;
+      repl_state = repl_transform_state(repl_state, REPL_NUMBER_EVENT, &num);
+      if (action == REPL_LEX_NUMBER_AND_CR_ACTION) {
+        repl_state = repl_transform_state(repl_state, REPL_CR_EVENT, NULL);
+      } else if (action == REPL_LEX_NUMBER_AND_APPEND_ACTION) {
+        ctx->buf[ctx->ptr ++] = ctx->byte;
+      }
+      break;
+    }
+    case REPL_LEX_HEX_ACTION:
+    case REPL_LEX_HEX_AND_CR_ACTION:
+    case REPL_LEX_HEX_AND_APPEND_ACTION: {
+      uint32_t num = hexstr_to_uint((char *)ctx->buf, ctx->ptr);
+      ctx->ptr = 0;
+      repl_state = repl_transform_state(repl_state, REPL_NUMBER_EVENT, &num);
+      if (action == REPL_LEX_HEX_AND_CR_ACTION) {
+        repl_state = repl_transform_state(repl_state, REPL_CR_EVENT, NULL);
+      } else if (action == REPL_LEX_NUMBER_AND_APPEND_ACTION) {
+        ctx->buf[ctx->ptr ++] = ctx->byte;
+      }
+      break;
+    }
+    }
+  }
+#+end_src
+** 词法解析上下文
+交互上下文里要存放词法解析命令过程中用到的临时数据。
+| name | type   |                                              |
+|------+--------+----------------------------------------------|
+| buf  | [byte] | 解析过程中使用的缓冲区, 命令行长度不超过 128 |
+| ptr  | uint16 | 记录可用缓冲区的位置                         |
+| byte | byte   | 解析的当前数据                               |
+
+#+begin_src c :noweb-ref repl-lex-context
+  struct repl_lex_context_t {
+    uint8_t buf[128];
+    uint16_t ptr;
+    uint8_t byte;
+  };
+#+end_src
+** 交互命令
+*** 帮助信息
+**** help
+#+begin_src c :noweb-ref repl-help
+  static void repl_help(void) {
+    repl_erase_usage();
+    repl_program_usage();
+    repl_read_usage();
+    repl_dump_usage();
+    repl_status_usage();
+    repl_write_usage();
+  }
+#+end_src
+**** erase usage
+#+begin_src c :noweb-ref repl-erase-usage
+  static void repl_erase_usage(void) {
+    output_string("ERASE USAGE:\r\n");
+    output_string("  ERASE SECTOR addr       擦除扇区\r\n");
+    output_string("  ERASE BLOCK addr        擦除块\r\n");
+    output_string("  ERASE CHIP              擦除芯片\r\n");
+  }
+#+end_src
+**** program usage
+#+begin_src c :noweb-ref repl-program-usage
+  static void repl_program_usage(void) {
+    output_string("PROGRAM USAGE:\r\n");
+    output_string("  PROGRAM addr data       写数据\r\n");
+  }
+#+end_src
+**** read usage
+#+begin_src c :noweb-ref repl-read-usage
+  static void repl_read_usage(void) {
+    output_string("READ USAGE:\r\n");
+    output_string("  READ addr len           读数据\r\n");
+  }
+#+end_src
+**** dump usage
+#+begin_src c :noweb-ref repl-dump-usage
+  static void repl_dump_usage(void) {
+    output_string("DUMP USAGE:\r\n");
+    output_string("  DUMP addr               dump sector 数据\r\n");
+  }
+#+end_src
+**** write usage
+#+begin_src c :noweb-ref repl-write-usage
+  static void repl_write_usage(void) {
+    output_string("WRITE USAGE:\r\n");
+    output_string("  WRITE ENABLE            写允许\r\n");
+    output_string("  WRITE DISABLE           写保护\r\n");
+  }
+#+end_src
+**** status usage
+#+begin_src c :noweb-ref repl-status-usage
+  static void repl_status_usage(void) {
+    output_string("STATUS USAGE:\r\n");
+    output_string("  STATUS                  FLASH 状态\r\n");
+  }
+#+end_src
+*** 擦除扇区
+#+begin_src c :noweb-ref repl-erase-sector
+  static void repl_erase_sector(uint32_t addr) {
+    if (w25x16_erase_sector(addr)) {
+      output_string("Done\r\n");
+    } else {
+      output_string("Failed\r\n");
+    }
+  }
+#+end_src
+*** 擦除块
+#+begin_src c :noweb-ref repl-erase-block
+  static void repl_erase_block(uint32_t addr) {
+    if (w25x16_erase_block(addr)) {
+      output_string("Done\r\n");
+    } else {
+      output_string("Failed\r\n");
+    }
+  }
+#+end_src
+*** 擦除芯片
+#+begin_src c :noweb-ref repl-erase-chip
+  static void repl_erase_chip(void) {
+    if (w25x16_erase_chip()) {
+      output_string("Done\r\n");
+    } else {
+      output_string("Failed\r\n");
+    }
+  }
+#+end_src
+*** 烧写数据
+#+begin_src c :noweb-ref repl-program
+  static void repl_program(uint32_t addr, uint8_t * data, uint8_t len) {
+    w25x16_write_data(addr, data, len);
+    for (uint8_t i = 0; i < len; i ++) {
+      output_char(data[i]);
+    }
+    output_newline();
+  }
+#+end_src
+*** 读数据
+#+begin_src c :noweb-ref repl-read
+  static void repl_read(uint32_t addr, uint8_t len) {
+    uint8_t buf[len + 3];
+    w25x16_read_data(addr, buf, len);
+    buf[len] = '\r';
+    buf[len + 1] = '\n';
+    buf[len + 2] = '\0';
+    output_string((char *)buf);
+    for (uint8_t i = 0; i < len; i ++) {
+      output_byte(buf[i]);
+      output_char(' ');
+    }
+    output_newline();
+  }
+#+end_src
+*** 配置写设置
+#+begin_src c :noweb-ref repl-write
+  static void repl_write(uint8_t enable) {
+    if (enable == 1) {
+      w25x16_write_enable();
+    } else {
+      w25x16_write_disable();
+    }
+  }
+#+end_src
+*** FLASH 状态
+#+begin_src c :noweb-ref repl-status
+  static void repl_status(void) {
+    output_string("Flash status: ");
+    output_byte(w25x16_read_sr());
+    output_newline();
+  }
+#+end_src
+*** DUMP 数据
+#+begin_src c :noweb-ref repl-dump
+  static void repl_dump(uint32_t addr) {
+  }
+#+end_src
+** 输出方法
+*** string
+#+begin_src c :noweb-ref repl-output-string-prototype
+  void output_string(char * str);
+#+end_src
+#+begin_src c :noweb-ref repl-output-string
+  void output_string(char * str) {
+    uint32_t slen = strlen(str);
+    uint8_t varsize = 0;
+    if (slen < 128) {
+      varsize = 1;
+    } else if (slen < 16384) {
+      varsize = 2;
+    } else if (slen < 2097152) {
+      varsize = 3;
+    } else {
+      varsize = 4;
+    }
+    if (slen + varsize <= ring_available(&repl_tx)) {
+      uint32_t reallen = slen;
+      while (reallen > 0x7F) {
+        ring_write(&repl_tx, (reallen & 0x7F) | 0x80);
+        reallen >>= 7;
+      }
+      ring_write(&repl_tx, reallen);
+      ring_write_array(&repl_tx, (uint8_t *)str, 0, slen);
+    }
+  }
+#+end_src
+*** char
+#+begin_src c :noweb-ref repl-output-char-prototype
+void output_char(char chr);
+#+end_src
+#+begin_src c :noweb-ref repl-output-char
+  void output_char(char chr) {
+    if (ring_available(&repl_tx) > 1) {
+      uint8_t buf[2] = { 0x01, chr };
+      ring_write_array(&repl_tx, buf, 0, 2);
+    }
+  }
+#+end_src
+
+*** byte
+#+begin_src c :noweb-ref repl-output-byte-prototype
+  void output_byte(uint8_t b);
+#+end_src
+#+begin_src c :noweb-ref repl-output-byte
+  void output_byte(uint8_t b) {
+    for (uint8_t i = 0; i < 2; i ++) {
+      switch ((b >> (8 - 4 * (i + 1))) & 0x0F) {
+      case 0x00: output_char('0'); break;
+      case 0x01: output_char('1'); break;
+      case 0x02: output_char('2'); break;
+      case 0x03: output_char('3'); break;
+      case 0x04: output_char('4'); break;
+      case 0x05: output_char('5'); break;
+      case 0x06: output_char('6'); break;
+      case 0x07: output_char('7'); break;
+      case 0x08: output_char('8'); break;
+      case 0x09: output_char('9'); break;
+      case 0x0A: output_char('A'); break;
+      case 0x0B: output_char('B'); break;
+      case 0x0C: output_char('C'); break;
+      case 0x0D: output_char('D'); break;
+      case 0x0E: output_char('E'); break;
+      case 0x0F: output_char('F'); break;
+      }
+    }
+  }
+#+end_src
+*** uint32
+#+begin_src c :noweb-ref repl-output-uint32-prototype
+  void output_uint32(uint32_t i);
+#+end_src
+#+begin_src c :noweb-ref repl-output-uint32
+  void output_uint32(uint32_t i) {
+    char buf[20];
+    bzero(buf, 20);
+    uint_to_string(i, buf);
+    output_string(buf);
+  }
+#+end_src
+*** newline
+#+begin_src c :noweb-ref repl-output-newline-prototype
+  void output_newline(void);
+#+end_src
+#+begin_src c :noweb-ref repl-output-newline
+  void output_newline(void) {
+    if (ring_available(&repl_tx) > 2) {
+      uint8_t buf[3] = { 0x02, '\r', '\n' };
+      ring_write_array(&repl_tx, buf, 0, 3);
+    }
+  }
+#+end_src

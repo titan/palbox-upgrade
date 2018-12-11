@@ -1,0 +1,486 @@
+#+STARTUP: indent
+* 驱动
+** 串口
+串口上下文中的 frame parser 用于获取 TX 中要发送的数据及长度。默认
+frame 由数据长度(varint)和数据组成，若不指定 frame parser 将按此 frame
+格式进行解析。
+#+begin_src c :tangle /dev/shm/upgrade/uart.h
+  #ifndef __UART_H
+  #define __UART_H
+  #include <stdint.h>
+  #include "ring.h"
+  struct uart_context_t;
+  typedef void (* uart_start_fn)(void);
+  typedef void (* uart_setup_fn)(struct uart_context_t * ctx);
+  typedef void (* uart_eventloop_fn)(struct uart_context_t * ctx, uint8_t *, uint32_t);
+  typedef uint32_t (* uart_frame_parser_fn)(struct ring_t * tx);
+  typedef uint32_t (* uart_reversed_size_fn)(void);
+  struct uart_context_t {
+    uint32_t baudrate;
+    uint8_t databits, stopbits;
+    struct ring_t * tx, * rx;
+    uint32_t loop_timer;
+    uint32_t loop_interval;
+    uint32_t tx_timer;
+    uint32_t tx_interval;
+    volatile uint32_t tx_to_send;
+    //uint8_t uart;
+    uart_setup_fn setup;
+    uart_start_fn start;
+    uart_eventloop_fn eventloop;
+    uart_frame_parser_fn tx_frame_parser;
+    uart_reversed_size_fn reversed_size;
+  };
+
+
+  void uart_init(uint8_t idx, struct uart_context_t * ctx);
+  void uart_setup(void);
+  void uart_start(void);
+  void uart_eventloop(uint8_t *, uint32_t);
+  uint32_t uart_reversed_size(void);
+  struct uart_context_t * uart_context(uint8_t idx);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/upgrade/uart.c
+  #include <stddef.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/usart.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include "defination.h"
+  #include "uart.h"
+
+  static int RCC_UART[5] = {
+    RCC_USART1,
+    RCC_USART2,
+    RCC_USART3,
+    RCC_UART4,
+    RCC_UART5,
+  };
+
+  static int RCC_UART_GPIO[5] = {
+    RCC_GPIOA,
+    RCC_GPIOA,
+    RCC_GPIOB,
+    RCC_GPIOC,
+    RCC_GPIOC | RCC_GPIOD,
+  };
+
+  static uint8_t NVIC_UART_IRQ[5] = {
+    NVIC_USART1_IRQ,
+    NVIC_USART2_IRQ,
+    NVIC_USART3_IRQ,
+    NVIC_UART4_IRQ,
+    NVIC_UART5_IRQ,
+  };
+
+  static uint32_t TX_GPIO_PORT[5] = {
+    GPIOA,
+    GPIOA,
+    GPIOB,
+    GPIOC,
+    GPIOC,
+  };
+
+  static uint32_t RX_GPIO_PORT[5] = {
+    GPIOA,
+    GPIOA,
+    GPIOB,
+    GPIOC,
+    GPIOD,
+  };
+
+  static int TX_GPIO_IO[5] = {
+    GPIO_USART1_TX,
+    GPIO_USART2_TX,
+    GPIO_USART3_TX,
+    GPIO_UART4_TX,
+    GPIO_UART5_TX,
+  };
+
+  static int RX_GPIO_IO[5] = {
+    GPIO_USART1_RX,
+    GPIO_USART2_RX,
+    GPIO_USART3_RX,
+    GPIO_UART4_RX,
+    GPIO_UART5_RX,
+  };
+
+  static uint32_t UART[5] = {
+    USART1,
+    USART2,
+    USART3,
+    UART4,
+    UART5,
+  };
+
+  struct uart_context_t * ctxs[5] = { NULL, NULL, NULL, NULL, NULL };
+
+  void uart_init(uint8_t idx, struct uart_context_t * ctx) {
+    ctxs[idx - 1] = ctx;
+  }
+
+  void uart_setup() {
+    for (uint8_t i = 0; i < 5; i ++) {
+      if (ctxs[i] != NULL) {
+        ctxs[i]->setup(ctxs[i]);
+
+        rcc_periph_clock_enable(RCC_UART[i]);
+        rcc_periph_clock_enable(RCC_UART_GPIO[i]);
+
+        nvic_enable_irq(NVIC_UART_IRQ[i]);
+
+        gpio_set_mode(TX_GPIO_PORT[i], GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, TX_GPIO_IO[i]);
+        gpio_set_mode(RX_GPIO_PORT[i], GPIO_MODE_INPUT, GPIO_CNF_INPUT_FLOAT, RX_GPIO_IO[i]);
+
+        /* Setup UART parameters. */
+        usart_set_baudrate(UART[i], ctxs[i]->baudrate);
+        usart_set_databits(UART[i], ctxs[i]->databits);
+        usart_set_stopbits(UART[i], ctxs[i]->stopbits);
+        usart_set_mode(UART[i], USART_MODE_TX_RX);
+        usart_set_parity(UART[i], USART_PARITY_NONE);
+        usart_set_flow_control(UART[i], USART_FLOWCONTROL_NONE);
+
+        /* Enable LOCK Receive interrupt. */
+        USART_CR1(UART[i]) |= USART_CR1_RXNEIE;
+
+        /* Finally enable the USART. */
+        usart_enable(UART[i]);
+
+      }
+    }
+  }
+
+  void uart_start() {
+    for (uint8_t i = 0; i < 5; i ++) {
+      if (ctxs[i] != NULL) {
+        if (ctxs[i]->start != NULL) {
+          ctxs[i]->start();
+        }
+      }
+    }
+  }
+
+  uint32_t uart_reversed_size(void) {
+    uint32_t size = 0;
+    for (uint8_t i = 0; i < 5; i ++) {
+      if (ctxs[i] != NULL) {
+        if (ctxs[i]->reversed_size != NULL) {
+          size += ctxs[i]->reversed_size();
+        }
+      }
+    }
+    return size;
+  }
+
+  void uart_eventloop(uint8_t * buffer, uint32_t bufsize) {
+    uint32_t ptr = 0;
+    for (uint8_t i = 0; i < 5; i ++) {
+      struct uart_context_t * ctx = ctxs[i];
+      if (ctx != NULL) {
+        if (systick > ctx->tx_timer) {
+          ctx->tx_timer = systick + ctx->tx_interval;
+          if (ctx->tx_to_send == 0) {
+            if (ctx->tx_frame_parser != NULL) {
+              ctx->tx_to_send = ctx->tx_frame_parser(ctx->tx);
+              if (ctx->tx_to_send != 0) {
+                USART_CR1(UART[i]) |= USART_CR1_TXEIE;
+              }
+            } else {
+              // use default frame parser
+              if (ring_length(ctx->tx) > 1) {
+                // saved length as varint type
+                uint32_t len = 0;
+                uint8_t byte = 0;
+                uint8_t count = 0;
+                ring_read(ctx->tx, &byte);
+                while (byte > 0x7F && ring_length(ctx->tx) > 0) {
+                  len |= (byte & 0x7F) << (count * 7);
+                  count ++;
+                  ring_read(ctx->tx, &byte);
+                }
+                len |= (byte & 0x7F) << (count * 7);
+
+                ctx->tx_to_send = len;
+                USART_CR1(UART[i]) |= USART_CR1_TXEIE;
+              }
+            }
+          }
+        }
+        if (systick > ctx->loop_timer) {
+          ctx->loop_timer = systick + ctx->loop_interval;
+          ctx->eventloop(ctx, buffer + ptr, ctx->reversed_size ? ctx->reversed_size(): 0);
+          ptr += ctx->reversed_size ? ctx->reversed_size(): 0;
+          USART_CR1(UART[i]) |= USART_CR1_RXNEIE;
+        }
+      }
+    }
+  }
+
+  struct uart_context_t * uart_context(uint8_t idx) {
+    return ctxs[idx - 1];
+  }
+
+  static void uart_isr(uint8_t idx) {
+
+    uint8_t data = 0;
+    uint32_t result = 0;
+
+    struct uart_context_t * ctx = ctxs[idx];
+    if (ctx == NULL) return;
+
+    /* Check if we were called because of RXNE. */
+    if (((USART_CR1(UART[idx]) & USART_CR1_RXNEIE) != 0) && ((USART_SR(UART[idx]) & USART_SR_RXNE) != 0)) {
+
+      /* Retrieve the data from the peripheral. */
+      data = usart_recv(UART[idx]);
+      ring_write(ctx->rx, data);
+      if (ring_available(ctx->rx) == 0) {
+        /* Disable the RXNEIE interrupt */
+        USART_CR1(UART[idx]) &= ~USART_CR1_RXNEIE;
+      }
+    }
+
+    /* Check if we were called because of TXE. */
+    if (((USART_CR1(UART[idx]) & USART_CR1_TXEIE) != 0) && ((USART_SR(UART[idx]) & USART_SR_TXE) != 0)) {
+      if (ctx->tx_to_send == 0) {
+        USART_CR1(UART[idx]) &= ~USART_CR1_TXEIE;
+        return;
+      }
+
+      result = ring_read(ctx->tx, &data);
+
+      if (result == 0) {
+        /* Disable the TXE interrupt, it's no longer needed. */
+        USART_CR1(UART[idx]) &= ~USART_CR1_TXEIE;
+      } else {
+        /* Put data into the transmit register. */
+        usart_send(UART[idx], data);
+        ctx->tx_to_send --;
+      }
+    }
+  }
+
+  void usart1_isr(void) {
+    uart_isr(1 - 1);
+  }
+
+  void usart2_isr(void) {
+    uart_isr(2 - 1);
+  }
+#+end_src
+** W25X16
+#+begin_src c :tangle /dev/shm/upgrade/w25x16.h
+  #ifndef __W25X16_H
+  #define __W25X16_H
+  #include <stdint.h>
+  void w25x16_setup(void);
+  void w25x16_read_data(uint32_t addr, uint8_t * buf, uint32_t len);
+  uint8_t w25x16_write_data(uint32_t addr, uint8_t * buf, uint8_t len);
+  uint8_t w25x16_erase_block(uint32_t addr);
+  uint8_t w25x16_erase_sector(uint32_t addr);
+  uint8_t w25x16_erase_chip(void);
+  uint8_t w25x16_read_sr(void);
+  void w25x16_write_enable(void);
+  void w25x16_write_disable(void);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/upgrade/w25x16.c
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include <libopencm3/stm32/spi.h>
+  #include <libopencm3/cm3/nvic.h>
+  #include "w25x16.h"
+
+  #define DUMMY           0xFF
+  #define W25_SR1_BUSY    0x01
+  #define W25_SR1_WEL     0x02
+
+  #define w25x16_enable(x) do {                   \
+      /*spi_enable(x);*/                              \
+      gpio_clear(GPIOA, GPIO2);                   \
+    } while (0)
+
+  #define w25x16_disable(x) do {                  \
+      gpio_set(GPIOA, GPIO2);                     \
+      /*spi_disable(x);*/                             \
+    } while (0)
+
+  void w25x16_setup(void) {
+    rcc_periph_clock_enable(RCC_GPIOA);
+
+    /* Enable SPI1 Periph and gpio clocks */
+    rcc_periph_clock_enable(RCC_SPI1);
+
+    /* Configure GPIOs: SS=PA4, SCK=PA5, MISO=PA6 and MOSI=PA7 */
+    gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, GPIO2);
+    gpio_set_mode(GPIOA, GPIO_MODE_OUTPUT_50_MHZ, GPIO_CNF_OUTPUT_ALTFN_PUSHPULL, GPIO5 | GPIO7);
+
+    gpio_set_mode(GPIOA, GPIO_MODE_INPUT, GPIO_CNF_INPUT_FLOAT, GPIO6);
+
+    /* Reset SPI, SPI_CR1 register cleared, SPI is disabled */
+    spi_reset(SPI1);
+
+    //spi_init_master(SPI1, SPI_CR1_BAUDRATE_FPCLK_DIV_64, SPI_CR1_CPOL_CLK_TO_1_WHEN_IDLE, SPI_CR1_CPHA_CLK_TRANSITION_2, SPI_CR1_DFF_8BIT, SPI_CR1_MSBFIRST);
+    spi_init_master(SPI1, SPI_CR1_BAUDRATE_FPCLK_DIV_64, SPI_CR1_CPOL_CLK_TO_0_WHEN_IDLE, SPI_CR1_CPHA_CLK_TRANSITION_1, SPI_CR1_DFF_8BIT, SPI_CR1_MSBFIRST);
+    //spi_init_master(SPI1, SPI_CR1_BAUDRATE_FPCLK_DIV_2, SPI_CR1_CPOL_CLK_TO_1_WHEN_IDLE, SPI_CR1_CPHA_CLK_TRANSITION_2, SPI_CR1_DFF_8BIT, SPI_CR1_MSBFIRST);
+
+    /*
+     ,* Set NSS management to software.
+     ,*
+     ,* Note:
+     ,* Setting nss high is very important, even if we are controlling the GPIO
+     ,* ourselves this bit needs to be at least set to 1, otherwise the spi
+     ,* peripheral will not send any data out.
+     ,*/
+    //spi_disable_software_slave_management(SPI1);
+    //spi_enable_ss_output(SPI1);
+    spi_enable_software_slave_management(SPI1);
+    //spi_enable_ss_output(SPI1);
+    spi_set_nss_high(SPI1);
+    //gpio_set(GPIOA, GPIO2);
+    spi_enable(SPI1);
+  }
+
+  uint8_t w25x16_read_sr(void) {
+    uint8_t sr;
+    w25x16_enable(SPI1);
+    spi_xfer(SPI1, 0x05);
+    sr = spi_xfer(SPI1, DUMMY);
+    w25x16_disable(SPI1);
+    return sr;
+  }
+
+  static inline void w25x16_wait(void) {
+    while (w25x16_read_sr() & W25_SR1_BUSY) {
+    }
+  }
+
+  static inline uint8_t w25x16_is_wprotect(void) {
+    w25x16_wait();
+    return !(w25x16_read_sr() & W25_SR1_WEL);
+  }
+
+  void w25x16_write_enable(void) {
+    w25x16_wait();
+    w25x16_enable(SPI1);
+    spi_xfer(SPI1, 0x06);
+    w25x16_disable(SPI1);
+    w25x16_wait();
+  }
+
+  void w25x16_write_disable(void) {
+    w25x16_wait();
+    w25x16_enable(SPI1);
+    spi_xfer(SPI1, 0x04);
+    w25x16_disable(SPI1);
+    w25x16_wait();
+  }
+
+  void w25x16_read_data(uint32_t addr, uint8_t * buf, uint32_t len) {
+    w25x16_wait();
+    w25x16_enable(SPI1);
+    spi_xfer(SPI1, 0x0B); // FAST READ
+    spi_xfer(SPI1, (addr >> 16) | 0xFF);
+    spi_xfer(SPI1, (addr >> 8) | 0xFF);
+    spi_xfer(SPI1, (addr >> 0) | 0xFF);
+    spi_xfer(SPI1, DUMMY);
+    for (uint32_t i = 0; i < len; i ++) {
+      buf[i] = spi_xfer(SPI1, DUMMY);
+    }
+    w25x16_disable(SPI1);
+  }
+
+  uint8_t w25x16_write_data(uint32_t addr, uint8_t * buf, uint8_t len) {
+    w25x16_write_enable();
+    w25x16_wait();
+    if (w25x16_is_wprotect()) {
+      return 0;
+    }
+    w25x16_enable(SPI1);
+    spi_xfer(SPI1, 0x02);
+    spi_xfer(SPI1, (addr >> 16) | 0xFF);
+    spi_xfer(SPI1, (addr >> 8) | 0xFF);
+    spi_xfer(SPI1, (addr >> 0) | 0xFF);
+
+    for (uint8_t i = 0; i < len; i ++) {
+      spi_xfer(SPI1, buf[i]);
+    }
+    w25x16_disable(SPI1);
+    return 1;
+  }
+
+  uint8_t w25x16_erase_block(uint32_t addr) {
+    if (w25x16_is_wprotect()) {
+      return 0;
+    }
+    w25x16_enable(SPI1);
+    spi_xfer(SPI1, 0xD8);
+    spi_xfer(SPI1, (addr >> 16) | 0xFF);
+    spi_xfer(SPI1, (addr >> 8) | 0xFF);
+    spi_xfer(SPI1, (addr >> 0) | 0xFF);
+    w25x16_disable(SPI1);
+    return 1;
+  }
+
+  uint8_t w25x16_erase_sector(uint32_t addr) {
+    if (w25x16_is_wprotect()) {
+      return 0;
+    }
+    w25x16_enable(SPI1);
+    spi_xfer(SPI1, 0x20);
+    spi_xfer(SPI1, (addr >> 16) | 0xFF);
+    spi_xfer(SPI1, (addr >> 8) | 0xFF);
+    spi_xfer(SPI1, (addr >> 0) | 0xFF);
+    w25x16_disable(SPI1);
+    return 1;
+  }
+
+  uint8_t w25x16_erase_chip(void) {
+    if (w25x16_is_wprotect()) {
+      return 0;
+    }
+    w25x16_enable(SPI1);
+    spi_xfer(SPI1, 0xC7);
+    w25x16_disable(SPI1);
+    if (!w25x16_is_wprotect()) {
+      return 0;
+    }
+    return 1;
+  }
+#+end_src
+** LED
+#+begin_src c :tangle /dev/shm/upgrade/led.h
+  #ifndef _LED_H
+  #define _LED_H
+
+  #include <libopencm3/stm32/gpio.h>
+
+  #define LED_PORT                 GPIOA
+  #define LED_IO                   GPIO8
+
+  #define led_on() do {                           \
+      gpio_clear(LED_PORT, LED_IO);               \
+    } while (0)
+
+  #define led_off() do {                          \
+      gpio_set(LED_PORT, LED_IO);                 \
+    } while (0)
+
+  void led_setup(void);
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/upgrade/led.c
+  #include <libopencm3/stm32/rcc.h>
+  #include "led.h"
+
+  void led_setup() {
+    rcc_periph_clock_enable (RCC_GPIOA);
+
+    /* Set GPIO8 (in GPIO port A) to 'output push-pull'. */
+    gpio_set_mode (GPIOA, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, GPIO8); // LED0
+    /* Set GPIO2 (in GPIO port D) to 'output push-pull'. */
+    //gpio_set_mode (GPIOD, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, GPIO2); // LED1
+    led_off();
+  }
+#+end_src

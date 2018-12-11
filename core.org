@@ -1,0 +1,133 @@
+#+STARTUP: indent
+* 核心系统
+** 基本框架
+#+begin_src c :tangle /dev/shm/upgrade/upgrade.c
+  #include <stddef.h>
+  #include <libopencm3/stm32/dbgmcu.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include <libopencm3/stm32/iwdg.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/usart.h>
+  #include <libopencm3/stm32/f1/bkp.h>
+  #include <libopencm3/stm32/pwr.h>
+  #include <libopencm3/cm3/systick.h>
+  #include "defination.h"
+  #include "ring.h"
+  #include "utility.h"
+  #include "uart.h"
+  #include "repl.h"
+  #include "w25x16.h"
+  #include "led.h"
+  #include "ec20.h"
+
+  volatile uint32_t systick = 0;
+
+  struct uart_context_t repl_context;
+  struct uart_context_t ec20_context;
+
+  void sys_tick_handler(void);
+
+  void sys_tick_handler(void) {
+    systick ++;
+  }
+  static uint8_t httpconn;
+
+  <<setup>>
+  <<mainloop>>
+  <<ec20-boot-ready>>
+#+end_src
+** 配置
+#+begin_src c :noweb-ref setup
+  static void setup(void) {
+    repl_context.eventloop = repl_eventloop;
+    repl_context.setup = repl_setup;
+
+    uart_init(1, &repl_context);
+
+    ec20_context.eventloop = ec20_eventloop;
+    ec20_context.setup = ec20_setup;
+
+    uart_init(2, &ec20_context);
+
+    rcc_clock_setup_in_hse_8mhz_out_72mhz();
+    rcc_periph_clock_enable(RCC_AFIO);
+    rcc_peripheral_enable_clock(&RCC_APB1ENR, RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN);
+    gpio_primary_remap(AFIO_MAPR_SWJ_CFG_JTAG_OFF_SW_ON, AFIO_MAPR_USART3_REMAP_NO_REMAP);
+    uart_setup();
+    //w25x16_setup();
+    led_setup();
+
+    systick = 0;
+
+    /* 72MHz / 8 => 9,000,000 counts per second */
+    systick_set_clocksource(STK_CSR_CLKSOURCE_AHB_DIV8);
+
+    /* 9,000,000/9,000 = 1000 overflows per second - every 1 ms one interrupt */
+    /* SysTick interrupt every N clock pulses: set reload to N-1 */
+    systick_set_reload(8999);
+    systick_interrupt_enable();
+
+    systick_counter_enable();
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref mainloop
+  uint8_t httpdone = 0;
+
+  static void http_get_callback(uint8_t * data, uint32_t len) {
+    output_string("response from server: ");
+    for (uint32_t i = 0; i < len; i ++) {
+      output_char(data[i]);
+    }
+    output_newline();
+    httpdone = 1;
+  }
+
+  int main(void) {
+
+    setup();
+    uart_start();
+    uint32_t loop_timer = systick + 999;
+
+    while (1) {
+      uint32_t reversed = uart_reversed_size();
+      if (reversed == 0) {
+        while (1) {
+          if (systick > loop_timer) {
+            loop_timer = systick + 999;
+            if (httpconn != 0 && httpdone == 0) {
+              ec20_http_get(httpconn, "http://dev.fengchaohuzhu.com:5080/", NULL, 0, http_get_callback, NULL);
+            }
+          }
+          uart_eventloop(NULL, 0);
+          if (uart_reversed_size() > 0) {
+            break;
+          }
+        }
+      } else {
+        uint8_t buffer[reversed];
+        while (1) {
+          if (systick > loop_timer) {
+            loop_timer = systick + 999;
+            if (httpconn != 0 && httpdone == 0) {
+              ec20_http_get(httpconn, "http://dev.fengchaohuzhu.com:5080/", NULL, 0, http_get_callback, NULL);
+            }
+          }
+          uart_eventloop(buffer, reversed);
+          if (uart_reversed_size() != reversed) {
+            break;
+          }
+        }
+      }
+    }
+
+    return 0;
+  }
+#+end_src
+** 上线处理
+#+begin_src c :noweb-ref ec20-boot-ready
+
+  void ec20_boot_ready_callback(void) {
+    httpconn = ec20_http_open();
+  }
+#+end_src

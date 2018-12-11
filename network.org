@@ -1,0 +1,1605 @@
+#+STARTUP: indent
+* 网络通讯
+网络通讯从 BOOT 部分开始，完成最基本的通讯模块设置。当通讯模块加入
+GPRS/LTE 网络成功，BOOT 过程结束，此后按程序逻辑，分别进入 UDP 部分和
+HTTP 部分。
+
+BOOT 部分，UDP 部分和 HTTP 部分采用相同的词法分析和语法分析模块。EC20
+模块支持 1 ~ 16 号上下文，为了方便区分，UDP 部分使用 1 ~ 12，HTTP 部分
+使用 13 ~ 16。
+
+由于支持多个上下文，而 EC20 只能通过 AT 命令进行控制，因此在发送命令给
+EC20 时，要标记发送的上下文编号，同时设置 BUSY 信号。当从 EC20 收到响
+应后，解除 BUSY 信号，执行下一条命令。
+
+** 程序框架
+#+begin_src c :tangle /dev/shm/upgrade/ec20.h
+  #ifndef _EC20_H
+  #define _EC20_H
+  #include <stdint.h>
+  #include "uart.h"
+
+  typedef void (* ec20_error_callback)(uint32_t err);
+  typedef void (* ec20_read_callback)(uint8_t * data, uint32_t len);
+
+  struct http_header_t {
+    char * key;
+    char * value;
+  };
+
+  void ec20_setup(struct uart_context_t * ctx);
+  void ec20_start(void);
+  void ec20_eventloop(struct uart_context_t * ctx, uint8_t * buffer, uint32_t bufsize);
+  uint8_t ec20_is_online(void);
+  extern void ec20_boot_ready_callback(void);
+
+  <<ec20-udp-open-prototype>>
+  <<ec20-udp-write-prototype>>
+  <<ec20-udp-close-prototype>>
+  <<ec20-http-open-prototype>>
+  <<ec20-http-get-prototype>>
+  <<ec20-http-close-prototype>>
+
+  #endif
+#+end_src
+#+begin_src c :tangle /dev/shm/upgrade/ec20.c
+  #include <stddef.h>
+  #include <stdarg.h>
+  #include <string.h>
+  #include <libopencm3/stm32/rcc.h>
+  #include <libopencm3/stm32/gpio.h>
+  #include "ec20.h"
+  #include "defination.h"
+  #include "base64.h"
+  #include "utility.h"
+  #include "packet.h"
+  #include "led.h"
+  #include "ec20-boot-fsm.h"
+  #include "ec20-udp-fsm.h"
+  #include "ec20-http-fsm.h"
+  #include "ec20-syntax-fsm.h"
+  #include "ec20-lex-fsm.h"
+  #include "stack.h"
+
+  #define EC20_RESET_RCC           RCC_GPIOC
+  #define EC20_RESET_PORT          GPIOC
+  #define EC20_RESET_IO            GPIO13
+  #define EC20_POWER_RCC           RCC_GPIOC
+  #define EC20_POWER_PORT          GPIOC
+  #define EC20_POWER_IO            GPIO0
+
+  #define RETRY 5
+
+  #define EC20_TX_BUFFER_BITSIZE 8
+  #define EC20_RX_BUFFER_BITSIZE 7
+  #define EC20_LEX_BUFFER_BITSIZE 10
+  #define EC20_STACK_BUFFER_BITSIZE 10
+
+  #define EC20_LEX_COPYING_MODE 1
+  #define EC20_LEX_PARSING_MODE 0
+
+  struct ec20_context_t {
+    uint8_t used; // used now?
+    uint8_t type; // 1 for udp; 2 for http
+    uint32_t state;
+    char * host; // for udp
+    uint16_t port; // for udp
+    char * url; // for http
+    struct http_header_t * headers; // for http
+    uint8_t headers_len; // for http
+    uint32_t err; // for http
+    uint32_t rspcode; // for http
+    uint8_t * data;
+    uint32_t data_len;
+    uint8_t lex_copying; // for http content
+    ec20_error_callback error_callback;
+    ec20_read_callback read_callback;
+    uint8_t qicsgp_retry;
+    uint8_t qiact_retry;
+    uint8_t qideact_retry;
+    uint8_t qiopen_retry;
+    uint8_t qiclose_retry;
+    uint32_t error;
+  };
+
+  struct ec20_lex_ctx_t {
+    uint8_t buf[2 << (EC20_LEX_BUFFER_BITSIZE - 1)];
+    uint16_t bptr;
+    uint8_t input;
+    uint8_t * data;
+    uint16_t dptr;
+    uint32_t data_len;
+    uint8_t mode;
+  };
+
+  #define ec20_lex_clear_buffer(ctx) do {                         \
+      bzero(ctx->buf, 2 << (EC20_LEX_BUFFER_BITSIZE - 1));        \
+      ctx->bptr = 0;                                              \
+    } while (0)
+
+  #define check_timeout_with_retry(cmd) do {                              \
+      if (systick > cmd##_timer) {                                        \
+        if (cmd##_retry == 0) {                                           \
+          cmd##_retry = RETRY;                                            \
+          ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL); \
+        } else {                                                          \
+          cmd##_retry --;                                                 \
+          ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_TIMEOUT_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL); \
+        }                                                                 \
+      }                                                                   \
+    } while (0)
+
+  uint32_t ec20_boot_state = EC20_BOOT_READY_STATE;
+  uint32_t ec20_syntax_state = EC20_SYNTAX_READY_STATE;
+  uint32_t ec20_lex_state = EC20_LEX_READY_STATE;
+
+  static struct ec20_context_t connections[17];
+  static uint8_t ec20_busy = 0;
+  static uint8_t ec20_contextid = 0;
+
+  static struct ring_t ec20_tx;
+  static struct ring_t ec20_rx;
+  static struct stack_t ec20_stack;
+  struct ec20_lex_ctx_t ec20_lex_ctx;
+
+  static uint8_t ec20_tx_buffer[2 << (EC20_TX_BUFFER_BITSIZE - 1)];
+  static uint8_t ec20_rx_buffer[2 << (EC20_RX_BUFFER_BITSIZE - 1)];
+  static uint8_t ec20_stack_buffer[2 << (EC20_STACK_BUFFER_BITSIZE - 1)];
+
+  static uint8_t ec20_rssi = 0;
+  static uint8_t ec20_ber = 0;
+  static uint32_t ec20_reset_times = 0;
+
+  static uint8_t is_online = 0;
+  static uint32_t rx_timer = 0;
+  static uint32_t loop_timer = 0;
+  static uint32_t reset_timer = 0;
+  static uint32_t power_off_timer = 0;
+  static uint32_t idle_timer = 0;
+  static uint32_t at_timer = 0; // 1s
+  static uint32_t ate_timer = 0; // 1s
+  static uint32_t cpin_timer = 0; // 5s
+  static uint32_t csq_idle_timer = 0; // retry interval 1s
+  static uint32_t csq_timer = 0; // 300 ms
+  static uint32_t creg_idle_timer = 0; // retry interval 1s
+  static uint32_t creg_timer = 0; // 300 ms
+  static uint32_t cgreg_idle_timer = 0; // retry interval 1s
+  static uint32_t cgreg_timer = 0; // 300 ms
+
+  static uint8_t at_retry = RETRY;
+  static uint8_t ate_retry = RETRY;
+  static uint8_t cpin_retry = RETRY;
+  static uint8_t csq_retry = RETRY;
+  static uint8_t creg_retry = RETRY;
+  static uint8_t cgreg_retry = RETRY;
+
+  static char hexchar[16] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+
+  static void byte2hexstr(uint8_t * dst, uint32_t size, uint8_t * src, uint32_t len) {
+    if (size < len * 2) {
+      return;
+    }
+
+    bzero(dst, size);
+    for (uint16_t i = 0; i < len; i ++) {
+      dst[i << 1] = hexchar[(src[i] >> 4) & 0x0F];
+      dst[(i << 1) + 1] = hexchar[src[i] & 0x0F];
+    }
+  }
+
+  static void ec20_reset_retry(void) {
+    at_retry = RETRY;
+    ate_retry = RETRY;
+    cpin_retry = RETRY;
+    csq_retry = RETRY;
+    creg_retry = RETRY;
+    cgreg_retry = RETRY;
+  }
+
+  <<ec20-cmd>>
+  <<ec20-str>>
+  <<ec20-start>>
+  <<ec20-tx-frame-parser>>
+  <<ec20-reversed-size>>
+  <<ec20-setup>>
+
+  inline uint8_t ec20_is_online(void) {
+    return is_online;
+  }
+  <<ec20-udp-open>>
+  <<ec20-udp-write>>
+  <<ec20-udp-close>>
+  <<ec20-http-open>>
+  <<ec20-http-get>>
+  <<ec20-http-close>>
+  <<ec20-mainloop>>
+  <<ec20-boot-fsm-action>>
+  <<ec20-udp-fsm>>
+  <<ec20-http-fsm>>
+  <<ec20-syntax-fsm>>
+  <<ec20-lex-fsm-action>>
+#+end_src
+** 配置
+EC20 将绑定到 USART2 上。
+#+begin_src c :noweb-ref ec20-setup
+  void ec20_setup(struct uart_context_t * ctx) {
+    ring_init(&ec20_tx, ec20_tx_buffer, EC20_TX_BUFFER_BITSIZE);
+    ring_init(&ec20_rx, ec20_rx_buffer, EC20_RX_BUFFER_BITSIZE + 0);
+    stack_init(&ec20_stack, ec20_stack_buffer, 2 << (EC20_STACK_BUFFER_BITSIZE - 1));
+
+    ctx->tx = &ec20_tx;
+    ctx->rx = &ec20_rx;
+    ctx->baudrate = 115200;
+    ctx->databits = 8;
+    ctx->stopbits = 1;
+    ctx->tx_interval = 99; // 10ms
+    ctx->loop_interval = 1; // 1ms
+    ctx->start = ec20_start;
+    ctx->tx_frame_parser = ec20_tx_frame_parser;
+    ctx->reversed_size = ec20_reversed_size;
+
+    rcc_periph_clock_enable(EC20_RESET_RCC);
+    rcc_periph_clock_enable(EC20_POWER_RCC);
+
+    gpio_set_mode(EC20_RESET_PORT, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, EC20_RESET_IO);
+    gpio_set_mode(EC20_POWER_PORT, GPIO_MODE_OUTPUT_2_MHZ, GPIO_CNF_OUTPUT_PUSHPULL, EC20_POWER_IO);
+  }
+#+end_src
+** 启动
+#+begin_src c :noweb-ref ec20-start
+  void ec20_start(void) {
+    ec20_reset_retry();
+    is_online = 0;
+    led_off();
+    bzero(&ec20_lex_ctx, sizeof(struct ec20_lex_ctx_t));
+
+    gpio_set(EC20_POWER_PORT, EC20_POWER_IO);
+    delay(500);
+    gpio_clear(EC20_POWER_PORT, EC20_POWER_IO);
+    gpio_clear(EC20_RESET_PORT, EC20_RESET_IO);
+    delay(500);
+    gpio_set(EC20_RESET_PORT, EC20_RESET_IO);
+  }
+#+end_src
+** 串口帧解析
+串口帧采用 contextid(uint8) + len(varint) + data(uint8 *) 的格式。当
+ec20 处于 BUSY 的状态时，暂停执行 AT 指令。
+#+begin_src c :noweb-ref ec20-tx-frame-parser
+  uint32_t ec20_tx_frame_parser(struct ring_t * tx) {
+    if (ec20_busy == 1) {
+      return 0;
+    }
+    if (ring_length(tx) < 3) {
+      return 0;
+    }
+
+    uint8_t conn = 0;
+
+    ec20_busy = 1;
+
+    ring_read(tx, &conn);
+    ec20_contextid = conn;
+
+    uint32_t len = 0;
+    uint8_t byte = 0;
+    uint8_t count = 0;
+    ring_read(tx, &byte);
+    while (byte > 127 && ring_length(tx) > 0) {
+      len |= (byte & 0x7F) << (count * 7);
+      count ++;
+      ring_read(tx, &byte);
+    }
+    len |= (byte & 0x7F) << (count * 7);
+
+    return len;
+  }
+#+end_src
+** 预留内存估算
+#+begin_src c :noweb-ref ec20-reversed-size
+  uint32_t ec20_reversed_size(void) {
+    return ec20_lex_ctx.data_len;
+  }
+#+end_src
+** 主循环
+#+begin_src c :noweb-ref ec20-mainloop
+  #include "repl.h"
+  void ec20_eventloop(struct uart_context_t * ctx, uint8_t * buffer, uint32_t bufsize) {
+    if (systick > loop_timer) {
+      loop_timer = systick + 999; // interval of one second
+      <<ec20-boot-fsm-event>>
+    }
+    <<ec20-lex-fsm-event>>
+  }
+#+end_src
+** BOOT状态机
+*** 事件捕获
+#+begin_src c :noweb-ref ec20-boot-fsm-event
+  switch (ec20_boot_state) {
+   case EC20_BOOT_BOOTED_STATE:
+     break;
+   case EC20_BOOT_ATING_STATE:
+     check_timeout_with_retry(at);
+     break;
+   case EC20_BOOT_ATEING_STATE:
+     check_timeout_with_retry(ate);
+     break;
+   case EC20_BOOT_CPINNING_STATE:
+     check_timeout_with_retry(cpin);
+     break;
+   case EC20_BOOT_CSQING_STATE:
+     check_timeout_with_retry(csq);
+     break;
+   case EC20_BOOT_CSQ_IDLE_STATE:
+     if (systick > csq_idle_timer) { // retry in 1s
+       ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_IDLE_TIMEOUT_EVENT, NULL);
+     }
+     break;
+   case EC20_BOOT_CREGING_STATE:
+     check_timeout_with_retry(creg);
+     break;
+   case EC20_BOOT_CREG_IDLE_STATE:
+     if (systick > creg_idle_timer) { // retry in 1s
+       ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_IDLE_TIMEOUT_EVENT, NULL);
+     }
+     break;
+   case EC20_BOOT_CGREGING_STATE:
+     check_timeout_with_retry(cgreg);
+     break;
+   case EC20_BOOT_CGREG_IDLE_STATE:
+     if (systick > cgreg_idle_timer) { // retry in 1s
+       ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_IDLE_TIMEOUT_EVENT, NULL);
+     }
+     break;
+   case EC20_BOOT_POWER_OFF_STATE:
+     if (systick > power_off_timer) { // repower ec20 in 500 ms
+       ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+     }
+     break;
+   case EC20_BOOT_RESETING_STATE:
+     if (systick - reset_timer > 499) { // reset ec20 in 500 ms
+       ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_TIMEOUT_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+     }
+     break;
+  }
+#+end_src
+*** 动作处理
+#+begin_src c :noweb-ref ec20-boot-fsm-action
+  void ec20_boot_do_action(enum EC20_BOOT_ACTION action, void * data) {
+    (void)data;
+    switch (action) {
+    case EC20_BOOT_POWER_OFF_ACTION:
+      gpio_set(EC20_POWER_PORT, EC20_POWER_IO);
+      power_off_timer = systick + 499; // 500ms
+      //output_log("POWER OFF ACTION\r\n");
+      break;
+    case EC20_BOOT_POWER_ON_ACTION:
+      gpio_clear(EC20_POWER_PORT, EC20_POWER_IO);
+      ec20_reset_times ++;
+      gpio_clear(EC20_RESET_PORT, EC20_RESET_IO);
+      reset_timer = systick;
+      break;
+    case EC20_BOOT_INITIAL_ACTION:
+      gpio_set(EC20_RESET_PORT, EC20_RESET_IO);
+      ec20_reset_retry();
+      ring_empty(&ec20_rx);
+      ring_empty(&ec20_tx);
+      stack_clear(&ec20_stack);
+      break;
+    case EC20_BOOT_AT_ACTION:
+    case EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_ACTION:
+      if (action == EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_ACTION) {
+        at_retry --;
+      }
+      ec20_cmd(0, "AT");
+      at_timer = systick + 999; // 1s
+      break;
+    case EC20_BOOT_ATE_ACTION:
+    case EC20_BOOT_RETRY_MINUS_1_NEWLINE_ATE_ACTION:
+      if (action == EC20_BOOT_RETRY_MINUS_1_NEWLINE_ATE_ACTION) {
+        ate_retry --;
+      }
+      ec20_cmd(0, "ATE0");
+      ate_timer = systick + 999; // 1s
+      break;
+    case EC20_BOOT_AT_PLUS_CPIN_QUESTION_ACTION:
+    case EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_PLUS_CPIN_QUESTION_ACTION:
+      if (action == EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_PLUS_CPIN_QUESTION_ACTION) {
+        ate_retry --;
+      }
+      ec20_cmd(0, "AT+CPIN?");
+      cpin_timer = systick + 4999; // 5s
+      break;
+    case EC20_BOOT_AT_PLUS_CSQ_ACTION:
+    case EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_PLUS_CSQ_ACTION:
+      if (action == EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_PLUS_CSQ_ACTION) {
+        csq_retry --;
+      }
+      ec20_cmd(0, "AT+CSQ");
+      csq_timer = systick + 300; // 300ms
+      break;
+    case EC20_BOOT_AT_PLUS_CREG_QUESTION_ACTION:
+    case  EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_PLUS_CREG_ACTION:
+      if (action == EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_PLUS_CREG_ACTION) {
+        creg_retry --;
+      }
+      ec20_cmd(0, "AT+CREG?");
+      creg_timer = systick + 300; // 300ms
+      break;
+    case EC20_BOOT_AT_PLUS_CGREG_QUESTION_ACTION:
+    case EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_PLUS_CGREG_ACTION:
+      if (action == EC20_BOOT_RETRY_MINUS_1_NEWLINE_AT_PLUS_CGREG_ACTION) {
+        cgreg_retry --;
+      }
+      ec20_cmd(0, "AT+CGREG?");
+      cgreg_timer = systick + 149999; // 150s
+      break;
+    case EC20_BOOT_RETRY_MINUS_1_ACTION:
+      switch (ec20_boot_state) {
+      case EC20_BOOT_CSQING_STATE:
+        csq_idle_timer = systick + 999; // 1s
+        csq_retry --;
+        break;
+      case EC20_BOOT_CREGING_STATE:
+        creg_idle_timer = systick + 999; // 1s
+        creg_retry --;
+        break;
+      case EC20_BOOT_CGREGING_STATE:
+        cgreg_idle_timer = systick + 999; // 1s
+        cgreg_retry --;
+        break;
+      default: break;
+      }
+      break;
+    case EC20_BOOT_BOOT_READY_ACTION:
+      ec20_boot_ready_callback();
+      break;
+    }
+  }
+#+end_src
+** UDP状态机
+#+begin_src c :noweb-ref ec20-udp-fsm
+  void ec20_udp_do_action(enum EC20_UDP_ACTION action, void * data) {
+    uint8_t conn = * (uint8_t *) data;
+    char connstr[3] = {0, 0, 0};
+    uint_to_string(conn, connstr);
+    switch (action) {
+    case EC20_UDP_AT_PLUS_QICSGP_ACTION:
+      ec20_cmd(conn, "AT+QICSGP=", connstr);
+      break;
+    case EC20_UDP_AT_PLUS_QIACT_ACTION:
+      ec20_cmd(conn, "AT+QIACT=", connstr);
+      break;
+    case EC20_UDP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QICSGP_ACTION: {
+      connections[conn].qicsgp_retry --;
+      ec20_cmd(conn, "AT+QICSGP=", connstr);
+      break;
+    }
+    case EC20_UDP_REBOOT_ACTION:
+      break;
+    case EC20_UDP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QIACT_ACTION:
+      connections[conn].qiact_retry --;
+      ec20_cmd(conn, "AT+QIACT=", connstr);
+      break;
+    case EC20_UDP_CONNECTED_ACTION:
+      //network_notify_connected();
+      break;
+    case EC20_UDP_AT_PLUS_QISENDEX_ACTION: {
+      uint32_t len = connections[conn].data_len;
+      uint8_t buf[len * 2 + 1];
+      bzero(buf, len * 2 + 1);
+      byte2hexstr(buf, len << 1, connections[conn].data, len);
+      ec20_cmd(conn, "AT+QISENDEX=0,\"", buf, "\"");
+      break;
+    }
+    case EC20_UDP_AT_PLUS_QICLOSE_ACTION:
+    case EC20_UDP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QICLOSE_ACTION:
+    case EC20_UDP_ERROR_CALLBACK_NEWLINE_AT_PLUS_QICLOSE_ACTION: {
+      if (action == EC20_UDP_ERROR_CALLBACK_NEWLINE_AT_PLUS_QICLOSE_ACTION) {
+        connections[conn].error_callback(connections[conn].error);
+      } else if (action == EC20_UDP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QICLOSE_ACTION) {
+        connections[conn].qiclose_retry --;
+      }
+      uint8_t cid = conn - 1;
+      char cidstr[3] = {0, 0, 0};
+      uint_to_string(cid, cidstr);
+      ec20_cmd(conn, "AT+QICLOSE=", cidstr);
+      break;
+    }
+    case EC20_UDP_ERROR_CALLBACK_NEWLINE_AT_PLUS_QIDEACT_ACTION:
+      break;
+    case EC20_UDP_READ_CALLBACK_ACTION:
+      connections[conn].read_callback(connections[conn].data, connections[conn].data_len);
+      break;
+    case EC20_UDP_ERROR_CALLBACK_ACTION:
+      connections[conn].error_callback(connections[conn].error);
+      break;
+    case EC20_UDP_AT_PLUS_QIOPEN_ACTION:
+    case EC20_UDP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QIOPEN_ACTION: {
+      if (action == EC20_UDP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QIOPEN_ACTION) {
+        connections[conn].qiopen_retry --;
+      }
+      uint8_t cid = conn - 1;
+      char cidstr[3] = {0, 0, 0};
+      uint_to_string(cid, cidstr);
+      char portstr[6] = {0, 0, 0, 0, 0, 0};
+      uint_to_string(connections[conn].port, portstr);
+      ec20_cmd(conn, "AT+QIOPEN=", connstr, ",", cidstr, ",\"UDP\",\"", connections[conn].host, "\",", portstr, ",0,1");
+      break;
+    }
+    case EC20_UDP_AT_PLUS_QIDEACT_ACTION:
+    case EC20_UDP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QIDEACT_ACTION: {
+      if (action == EC20_UDP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QIDEACT_ACTION) {
+        connections[conn].qideact_retry --;
+      }
+      uint8_t cid = conn - 1;
+      char cidstr[3] = {0, 0, 0};
+      uint_to_string(cid, cidstr);
+      ec20_cmd(conn, "AT+DEACT=", cidstr);
+      break;
+    }
+    case EC20_UDP_CLEAR_ACTION:
+      break;
+    }
+  }
+#+end_src
+** HTTP状态机
+#+begin_src c :noweb-ref ec20-http-fsm
+  void ec20_http_do_action(enum EC20_HTTP_ACTION action, void * data) {
+    uint8_t conn = * (uint8_t *) data;
+    char connstr[10];
+    uint_to_string(conn, connstr);
+    switch (action) {
+    case EC20_HTTP_AT_PLUS_QHTTPCFG_CONTEXTID_ACTION:
+      ec20_cmd(conn, "AT+QHTTPCFG=\"contextid\",", connstr);
+      break;
+    case EC20_HTTP_AT_PLUS_QHTTPCFG_HEADER_ACTION:
+      ec20_cmd(conn, "AT+QHTTPCFG=\"requestheader\",1");
+      break;
+    case EC20_HTTP_AT_PLUS_QICSGP_ACTION:
+    case EC20_HTTP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QICSGP_ACTION:
+      ec20_cmd(conn, "AT+QICSGP=", connstr, ",1,\""QUOTE(APN)"\",\"\",\"\",1");
+      if (action == EC20_HTTP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QICSGP_ACTION) {
+        connections[conn].qicsgp_retry --;
+      }
+      break;
+    case EC20_HTTP_AT_PLUS_QIACT_ACTION:
+    case EC20_HTTP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QIACT_ACTION:
+      if (action == EC20_HTTP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QIACT_ACTION) {
+        connections[conn].qiact_retry --;
+      }
+      ec20_cmd(conn, "AT+QIACT=", connstr);
+      break;
+    case EC20_HTTP_REBOOT_ACTION:
+      break;
+    case EC20_HTTP_ERROR_CALLBACK_NEWLINE_AT_PLUS_QIDEACT_ACTION:
+      break;
+    case EC20_HTTP_AT_PLUS_QHTTPURL_ACTION: {
+      uint32_t len = strlen(connections[conn].url);
+      char lenstr[10];
+      uint_to_string(len, lenstr);
+      ec20_cmd(conn, "AT+QHTTPURL=", lenstr);
+      break;
+    }
+    case EC20_HTTP_URL_ACTION: {
+      ec20_str(conn, connections[conn].url);
+      break;
+    }
+    case EC20_HTTP_AT_PLUS_HTTPGET_ACTION:
+      ec20_cmd(conn, "AT+QHTTPGET=60");
+      break;
+    case EC20_HTTP_AT_PLUS_HTTPGET_HEADERSIZE_ACTION: {
+      uint32_t total = 0;
+      for (uint8_t i = 0; i < connections[conn].headers_len; i ++) {
+        total += strlen(connections[conn].headers[i].key) + 1 + 1 + strlen(connections[conn].headers[i].value) + 2;
+      }
+      char totalstr[10];
+      uint_to_string(total, totalstr);
+      ec20_cmd(conn, "AT+QHTTPGET=60,", totalstr);
+      break;
+    }
+    case EC20_HTTP_HEADER_ACTION: {
+      for (uint8_t i = 0; i < connections[conn].headers_len; i ++) {
+        ec20_cmd(conn, connections[conn].headers[i].key, ": ", connections[conn].headers[i].value);
+      }
+      break;
+    }
+    case EC20_HTTP_SET_DATA_LEN_NEWLINE_AT_PLUS_QHTTPREAD_ACTION:
+      ec20_lex_ctx.data_len = connections[conn].data_len;
+      ec20_cmd(conn, "AT+QHTTPREAD");
+      break;
+    case EC20_HTTP_AT_PLUS_QIDEACT_ACTION:
+      ec20_cmd(conn, "AT+QIDEACT=", connstr);
+      break;
+    case EC20_HTTP_SWITCH_TO_COPY_MODE_ACTION:
+      connections[conn].lex_copying = 1;
+      break;
+    case EC20_HTTP_READ_CALLBACK_ACTION:
+      connections[conn].lex_copying = 0;
+      connections[conn].read_callback(connections[conn].data, connections[conn].data_len);
+      break;
+    case EC20_HTTP_CLEAR_ACTION:
+      connections[conn].used = 0;
+      break;
+    case EC20_HTTP_RETRY_MINUS_1_NEWLINE_AT_PLUS_QIDEACT_ACTION:
+      connections[conn].qideact_retry --;
+      ec20_cmd(conn, "AT+QIDEACT=", connstr);
+      break;
+    }
+  }
+#+end_src
+** 语法状态机
+#+begin_src c :noweb-ref ec20-syntax-fsm
+  void ec20_syntax_do_action(enum EC20_SYNTAX_ACTION action, void * data) {
+    switch (action) {
+    case EC20_SYNTAX_OK_ACTION:
+      if (ec20_contextid == 0) {
+        ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_OK_EVENT, NULL);
+        ec20_busy = 0;
+      } else {
+        if (connections[ec20_contextid].used) {
+          if (connections[ec20_contextid].type == 1) {
+            connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_OK_EVENT, &ec20_contextid);
+          } else {
+            if (connections[ec20_contextid].headers == NULL) {
+              connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_OK_COMMA_HEADERS_EQUALS_NULL_EVENT, &ec20_contextid);
+            } else {
+              connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_OK_COMMA_HEADERS_NOT_EQUALS_NULL_EVENT, &ec20_contextid);
+            }
+          }
+          ec20_busy = 0;
+        }
+      }
+      break;
+    case EC20_SYNTAX_ERROR_ACTION:
+      output_string("ERROR ec20_contextid ");
+      output_uint32(ec20_contextid);
+      output_newline();
+      if (ec20_contextid == 0) {
+        // could not happen
+      } else {
+        if (connections[ec20_contextid].used) {
+          if (connections[ec20_contextid].type == 1) {
+            switch(connections[ec20_contextid].state) {
+            case EC20_UDP_QICSGPING_STATE:
+            case EC20_UDP_QICSGP_ERROR_STATE:
+              if (connections[ec20_contextid].qicsgp_retry > 0) {
+                connections[ec20_contextid].qicsgp_retry --;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_GREATER_THAN_0_EVENT, &ec20_contextid);
+              } else {
+                connections[ec20_contextid].qicsgp_retry = RETRY;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_EQUALS_0_EVENT, &ec20_contextid);
+              }
+              ec20_busy = 0;
+              break;
+            case EC20_UDP_QIACTING_STATE:
+            case EC20_UDP_QIACT_ERROR_STATE:
+              if (connections[ec20_contextid].qiact_retry > 0) {
+                connections[ec20_contextid].qiact_retry --;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_GREATER_THAN_0_EVENT, &ec20_contextid);
+              } else {
+                connections[ec20_contextid].qiact_retry = RETRY;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_EQUALS_0_EVENT, &ec20_contextid);
+              }
+              ec20_busy = 0;
+              break;
+            case EC20_UDP_QIOPEN_OKAY_STATE:
+              if (connections[ec20_contextid].qiopen_retry > 0) {
+                connections[ec20_contextid].qiopen_retry --;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_GREATER_THAN_0_EVENT, &ec20_contextid);
+              } else {
+                connections[ec20_contextid].qiopen_retry = RETRY;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_EQUALS_0_EVENT, &ec20_contextid);
+              }
+              ec20_busy = 0;
+              break;
+            case EC20_UDP_QICLOSING_STATE:
+            case EC20_UDP_QICLOSE_ERROR_STATE:
+              if (connections[ec20_contextid].qiclose_retry > 0) {
+                connections[ec20_contextid].qiclose_retry --;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_GREATER_THAN_0_EVENT, &ec20_contextid);
+              } else {
+                connections[ec20_contextid].qiclose_retry = RETRY;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_EQUALS_0_EVENT, &ec20_contextid);
+              }
+              ec20_busy = 0;
+              break;
+            case EC20_UDP_QIDEACTING_STATE:
+            case EC20_UDP_QIDEACT_ERROR_STATE:
+              if (connections[ec20_contextid].qideact_retry > 0) {
+                connections[ec20_contextid].qideact_retry --;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_GREATER_THAN_0_EVENT, &ec20_contextid);
+              } else {
+                connections[ec20_contextid].qideact_retry = RETRY;
+                connections[ec20_contextid].state = ec20_udp_transform_state(connections[ec20_contextid].state, EC20_UDP_ERROR_COMMA_RETRY_EQUALS_0_EVENT, &ec20_contextid);
+              }
+              ec20_busy = 0;
+              break;
+            default:
+              break;
+            }
+          } else {
+            switch(connections[ec20_contextid].state) {
+            case EC20_HTTP_QICSGPING_STATE:
+            case EC20_HTTP_QICSGP_ERROR_STATE:
+              if (connections[ec20_contextid].qicsgp_retry > 0) {
+                connections[ec20_contextid].qicsgp_retry --;
+                connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_ERROR_COMMA_RETRY_GREATER_THAN_0_EVENT, &ec20_contextid);
+              } else {
+                connections[ec20_contextid].qicsgp_retry = RETRY;
+                connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_ERROR_COMMA_RETRY_EQUALS_0_EVENT, &ec20_contextid);
+              }
+              ec20_busy = 0;
+              break;
+            case EC20_HTTP_QIACTING_STATE:
+            case EC20_HTTP_QIACT_ERROR_STATE:
+              if (connections[ec20_contextid].qiact_retry > 0) {
+                connections[ec20_contextid].qiact_retry --;
+                connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_ERROR_COMMA_RETRY_GREATER_THAN_0_EVENT, &ec20_contextid);
+              } else {
+                connections[ec20_contextid].qiact_retry = RETRY;
+                connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_ERROR_COMMA_RETRY_EQUALS_0_EVENT, &ec20_contextid);
+              }
+              ec20_busy = 0;
+              break;
+            case EC20_HTTP_QIDEACTING_STATE:
+            case EC20_HTTP_QIDEACT_ERROR_STATE:
+              if (connections[ec20_contextid].qideact_retry > 0) {
+                connections[ec20_contextid].qideact_retry --;
+                connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_ERROR_COMMA_RETRY_GREATER_THAN_0_EVENT, &ec20_contextid);
+              } else {
+                connections[ec20_contextid].qideact_retry = RETRY;
+                connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_ERROR_COMMA_RETRY_EQUALS_0_EVENT, &ec20_contextid);
+              }
+              ec20_busy = 0;
+              break;
+            default:
+              break;
+            }
+          }
+        }
+      }
+      break;
+    case EC20_SYNTAX_RDY_ACTION:
+      ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_RDY_EVENT, NULL);
+      ec20_busy = 0;
+      break;
+    case EC20_SYNTAX_PUSH_DECIMAL_ACTION: {
+      uint32_t * num = (uint32_t * )data;
+      stack_push(&ec20_stack, (* num) & 0xFF);
+      stack_push(&ec20_stack, ((* num) >> 8) & 0xFF);
+      stack_push(&ec20_stack, ((* num) >> 16) & 0xFF);
+      stack_push(&ec20_stack, ((* num) >> 24) & 0xFF);
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CGREG_COLON_N_COMMA_STAT_ACTION: {
+      uint32_t stat = 0;
+      uint8_t stat0 = 0, stat1 = 0, stat2 = 0, stat3 = 0;
+      stack_top(&ec20_stack, &stat3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &stat2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &stat1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &stat0);
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack); // ignore N
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack);
+
+      stat = (stat3 << 24) | (stat2 << 16) | (stat1 << 8) | stat0;
+      if (stat == 1) {
+        ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CGREG_COLON_X_COMMA_1_EVENT, NULL);
+      } else {
+        if (cgreg_retry == 0) {
+          cgreg_retry = RETRY;
+          ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CGREG_COLON_X_COMMA_0_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          cgreg_retry --;
+          ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CGREG_COLON_X_COMMA_0_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+      }
+      ec20_busy = 0;
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CPIN_READY_ACTION: {
+      ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CPIN_COLON_READY_EVENT, NULL);
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CME_ERROR_CODE_ACTION: {
+      uint32_t code = 0;
+      uint8_t code0 = 0, code1 = 0, code2 = 0, code3 = 0;
+      stack_top(&ec20_stack, &code3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &code2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &code1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &code0);
+      stack_pop(&ec20_stack);
+
+      code = (code3 << 24) | (code2 << 16) | (code1 << 8) | code0;
+      if (code == 14) {
+        ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CME_ERROR_14_EVENT, NULL);
+      } else {
+        ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CME_ERROR_EVENT, &code);
+      }
+      ec20_busy = 0;
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CREG_COLON_N_COMMA_STAT_ACTION: {
+      uint32_t stat = 0;
+      uint8_t stat0 = 0, stat1 = 0, stat2 = 0, stat3 = 0;
+      stack_top(&ec20_stack, &stat3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &stat2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &stat1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &stat0);
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack); // ignore N
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack);
+      stack_pop(&ec20_stack);
+
+      stat = (stat3 << 24) | (stat2 << 16) | (stat1 << 8) | stat0;
+      if (stat == 1) {
+        ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CREG_COLON_X_COMMA_1_EVENT, NULL);
+      } else {
+        if (creg_retry == 0) {
+          creg_retry = RETRY;
+          ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CREG_COLON_X_COMMA_0_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          creg_retry --;
+          ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CREG_COLON_X_COMMA_0_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+      }
+      ec20_busy = 0;
+      break;
+    }
+    case EC20_SYNTAX_PLUS_CSQ_COLON_RSSI_COMMA_BER_ACTION: {
+      uint8_t ber0 = 0, ber1 = 0, ber2 = 0, ber3 = 0;
+      uint8_t rssi0 = 0, rssi1 = 0, rssi2 = 0, rssi3 = 0;
+
+      stack_top(&ec20_stack, &ber3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &ber2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &ber1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &ber0);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &rssi3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &rssi2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &rssi1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &rssi0);
+      stack_pop(&ec20_stack);
+
+      ec20_ber = (ber3 << 24) | (ber2 << 16) | (ber1 << 8) | ber0;
+      ec20_rssi = (rssi3 << 24) | (rssi2 << 16) | (rssi1 << 8) | rssi0;
+      if (ec20_rssi == 99) {
+        if (csq_retry == 0) {
+          csq_retry = RETRY;
+          ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CSQ_COLON_99_COMMA_XX_NEWLINE_RETRY_EQUALS_0_EVENT, NULL);
+        } else {
+          csq_retry --;
+          ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CSQ_COLON_99_COMMA_XX_NEWLINE_RETRY_GREATER_THAN_0_EVENT, NULL);
+        }
+      } else {
+        ec20_boot_state = ec20_boot_transform_state(ec20_boot_state, EC20_BOOT_PLUS_CSQ_COLON_XX_COMMA_XX_EVENT, &ec20_rssi);
+      }
+      ec20_busy = 0;
+      break;
+    }
+    case EC20_SYNTAX_PLUS_QHTTPGET_COLON_ERR_COMMA_RSPCODE_COMMA_LEN_ACTION: {
+      uint32_t err = 0;
+      uint32_t rspcode = 0;
+      uint32_t len = 0;
+      uint8_t err0 = 0, err1 = 0, err2 = 0, err3 = 0;
+      uint8_t rspcode0 = 0, rspcode1 = 0, rspcode2 = 0, rspcode3 = 0;
+      uint8_t len0 = 0, len1 = 0, len2 = 0, len3 = 0;
+      stack_top(&ec20_stack, &len3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &len2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &len1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &len0);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &rspcode3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &rspcode2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &rspcode1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &rspcode0);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &err3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &err2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &err1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &err0);
+      stack_pop(&ec20_stack);
+
+      err = (err3 << 24) | (err2 << 16) | (err1 << 8) | err0;
+      rspcode = (rspcode3 << 24) | (rspcode2 << 16) | (rspcode1 << 8) | rspcode0;
+      len = (len3 << 24) | (len2 << 16) | (len1 << 8) | len0;
+
+      for (uint8_t conn = 13; conn < 16; conn ++) {
+        if (connections[conn].used == 1 && connections[conn].state == EC20_HTTP_QHTTPGETING_STATE) {
+          connections[conn].err = err;
+          connections[conn].rspcode = rspcode;
+          connections[conn].data_len = len;
+          connections[conn].state = ec20_http_transform_state(connections[conn].state, EC20_HTTP_PLUS_QHTTPGET_COLON_ERR_COMMA_CODE_COMMA_LENGTH_EVENT, &conn);
+        }
+      }
+      break;
+    }
+    case EC20_SYNTAX_PLUS_QIOPEN_COLON_CONNECTID_COMMA_ERR_ACTION: {
+      uint32_t connectid = 0;
+      uint32_t err = 0;
+      uint8_t connectid0 = 0, connectid1 = 0, connectid2 = 0, connectid3 = 0;
+      uint8_t err0 = 0, err1 = 0, err2 = 0, err3 = 0;
+
+      stack_top(&ec20_stack, &err3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &err2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &err1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &err0);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &connectid3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &connectid2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &connectid1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &connectid0);
+      stack_pop(&ec20_stack);
+
+      connectid = (connectid3 << 24) | (connectid2 << 16) | (connectid1 << 8) | connectid0;
+      err = (err3 << 24) | (err2 << 16) | (err1 << 8) | err0;
+
+      uint8_t fd = (uint8_t)connectid + 1;
+      if (err == 0) {
+        connections[fd].state = ec20_udp_transform_state(connections[fd].state, EC20_UDP_PLUS_QIOPEN_COLON_CONNECTID_COMMA_0_EVENT, &fd);
+        //output_log("Change systick from ");
+        //output_number(systick);
+        //output_string(" to ");
+        //systick += (network_heart_rate - 1 - ((systick >> 7) & network_heart_rate)) << 7;
+        //output_number(systick);
+        //output_newline();
+      } else {
+        if (connections[fd].qiopen_retry == 0) {
+          connections[fd].state = ec20_udp_transform_state(connections[fd].state, EC20_UDP_PLUS_QIOPEN_COLON_CONNECTID_COMMA_X_NEWLINE_RETRY_EQUALS_0_EVENT, &fd);
+        } else {
+          connections[fd].qiopen_retry --;
+          connections[fd].state = ec20_udp_transform_state(connections[fd].state, EC20_UDP_PLUS_QIOPEN_COLON_CONNECTID_COMMA_X_NEWLINE_RETRY_GREATER_THAN_0_EVENT, &fd);
+        }
+      }
+      ec20_busy = 0;
+      break;
+    }
+    case EC20_SYNTAX_PUSH_STRING_ACTION: {
+      uint8_t * len = ((uint8_t **)data)[1];
+      uint8_t * dat = ((uint8_t **)data)[0];
+      for (uint8_t i = * len - 1; i != 0xFF; i --) {
+        stack_push(&ec20_stack, dat[i]);
+      }
+      stack_push(&ec20_stack,  (* len) & 0xFF);
+      stack_push(&ec20_stack,  ((* len) >> 8) & 0xFF);
+      break;
+    }
+    case EC20_SYNTAX_PLUS_QIURC_COLON_STR_COMMA_ID_ACTION: {
+      uint32_t conn = 0;
+      uint8_t conn0 = 0, conn1 = 0, conn2 = 0, conn3 = 0;
+      stack_top(&ec20_stack, &conn3);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &conn2);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &conn1);
+      stack_pop(&ec20_stack);
+      stack_top(&ec20_stack, &conn0);
+      stack_pop(&ec20_stack);
+
+      conn = (conn3 << 24) | (conn2 << 16) | (conn1 << 8) | conn0;
+
+      uint8_t strlen = 0;
+      stack_top(&ec20_stack, &strlen); // length of string
+      uint8_t buf[strlen + 1];
+      bzero(buf, strlen + 1);
+      stack_pop(&ec20_stack); // pop length of string
+      for (uint8_t i = 0; i < strlen; i ++) {
+        stack_top(&ec20_stack, buf + i);
+        stack_pop(&ec20_stack); // pop string
+      }
+
+      if (strlen == 8 &&
+          buf[0] == 'p' &&
+          buf[1] == 'd' &&
+          buf[2] == 'p' &&
+          buf[3] == 'd' &&
+          buf[4] == 'e' &&
+          buf[5] == 'a' &&
+          buf[6] == 'c' &&
+          buf[7] == 't') {
+        connections[conn].state = ec20_udp_transform_state(connections[conn].state, EC20_UDP_PLUS_QIURC_COLON_DOUBLE_QUOTES_PDPDEACT_DOUBLE_QUOTES_COMMA_CONTEXTID_EVENT, &conn);
+        ec20_busy = 0;
+      }
+      break;
+    }
+    case EC20_SYNTAX_PLUS_QIURC_COLON_STR_COMMA_ID_COMMA_LENGTH_COMMA_DATA_ACTION: {
+      uint8_t * tlen = ((uint8_t **)data)[1];
+      uint8_t * token = ((uint8_t **)data)[0];
+
+      uint8_t * dat[2];
+      dat[0] = tlen;
+      dat[1] = token;
+      uint8_t len = 0;
+      uint8_t conn;
+      stack_top(&ec20_stack, &len);
+      stack_pop(&ec20_stack); // pop length
+      stack_top(&ec20_stack, &conn);
+      conn ++; // change to context id
+      stack_pop(&ec20_stack); // pop connectid
+      uint8_t strlen = 0;
+      stack_top(&ec20_stack, &strlen); // length of string
+      stack_pop(&ec20_stack); // pop length of string
+      for (uint8_t i = 0; i < strlen; i ++) {
+        stack_pop(&ec20_stack); // pop string
+      }
+      if (len == *tlen) {
+        if (strlen == 4) {
+          connections[conn].state = ec20_udp_transform_state(connections[conn].state, EC20_UDP_PLUS_QIURC_COLON_DOUBLE_QUOTES_RECV_DOUBLE_QUOTES_COMMA_CONNECTID_COMMA_LENGTH_NEWLINE_DATA_EVENT, &conn);
+          ec20_busy = 0;
+        }
+      }
+      break;
+    }
+    case EC20_SYNTAX_CONNECT_ACTION: {
+      if (ec20_contextid == 0) {
+        // could not happen
+      } else {
+        if (connections[ec20_contextid].used) {
+          if (connections[ec20_contextid].type == 1) {
+            // could not happend
+          } else {
+            connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_CONNECT_EVENT, &ec20_contextid);
+            ec20_busy = 0;
+          }
+        }
+      }
+      break;
+    }
+    case EC20_SYNTAX_DATA_COLON_LEN_COMMA_DATA_ACTION: {
+      uint16_t * len = ((uint16_t **)data)[1];
+      uint8_t * dat = ((uint8_t **)data)[0];
+
+      if (ec20_contextid == 0) {
+        // could not happen
+      } else {
+        if (connections[ec20_contextid].used) {
+          if (connections[ec20_contextid].type == 1) {
+            // could not happend
+          } else {
+            connections[ec20_contextid].data = dat;
+            connections[ec20_contextid].data_len = * len;
+            connections[ec20_contextid].state = ec20_http_transform_state(connections[ec20_contextid].state, EC20_HTTP_DATA_COLON_LEN_COMMA_DATA_EVENT, &ec20_contextid);
+            ec20_busy = 0;
+          }
+        }
+      }
+
+      break;
+    }
+    }
+  }
+#+end_src
+** 词法状态机
+*** 事件捕获
+判断是否是 EOF 的条件比较复杂，正常情况下，150 秒没有收到数据就是 EOF
+了。当语法分析状态机是 CONNECT 时，1 秒后没有收到数据就算 EOF。如果不
+这样处理，HTTP 状态机在发送 AT+QHTTPURL 命令后就会卡住。
+#+begin_src c :noweb-ref ec20-lex-fsm-event
+  uint32_t rxlen = ring_length(&ec20_rx);
+  if (rxlen > 0) {
+    rx_timer = systick + 149999;
+
+    ec20_lex_ctx.data = buffer;
+
+    uint8_t byte;
+    while (ring_read(&ec20_rx, &byte) != 0) {
+      if (connections[ec20_contextid].lex_copying) {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_COPY_EVENT, &ec20_lex_ctx); // switch lexer to copy mode
+      }
+      if (ec20_lex_ctx.mode == EC20_LEX_COPYING_MODE && ec20_lex_ctx.dptr == ec20_lex_ctx.data_len) {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_COPY_FULL_EVENT, &ec20_lex_ctx);
+      }
+      output_char(byte);
+      ec20_lex_ctx.input = byte;
+      if ('0' <= byte && byte <= '9') {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_DIGIT_EVENT, &ec20_lex_ctx);
+      } else if (byte == ':') {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_COLON_EVENT, &ec20_lex_ctx);
+      } else if (byte == ',') {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_COMMA_EVENT, &ec20_lex_ctx);
+      } else if (byte == '"') {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_DOUBLE_QUOTES_EVENT, &ec20_lex_ctx);
+      } else if (byte == ' ') {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_SPC_EVENT, &ec20_lex_ctx);
+      } else if (byte == '\r') {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_CR_EVENT, &ec20_lex_ctx);
+      } else if (byte == '\n') {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_LF_EVENT, &ec20_lex_ctx);
+      } else {
+        ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_OTHERS_EVENT, &ec20_lex_ctx);
+      }
+    }
+  }
+
+  if (ec20_syntax_state == EC20_SYNTAX_CONNECT_STATE) {
+    if (systick > rx_timer - 148999) {
+      ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_EOF_EVENT, &ec20_lex_ctx);
+      rx_timer = systick + 149999;
+      output_newline();
+    }
+  } else {
+    if (systick > rx_timer) { // 150 s
+      ec20_lex_state = ec20_lex_transform_state(ec20_lex_state, EC20_LEX_EOF_EVENT, &ec20_lex_ctx);
+      rx_timer = systick + 149999;
+      output_newline();
+    }
+  }
+#+end_src
+*** 动作处理
+#+begin_src c :noweb-ref ec20-lex-fsm-action
+  void ec20_lex_do_action(enum EC20_LEX_ACTION action, void * data) {
+    struct ec20_lex_ctx_t * ctx = (struct ec20_lex_ctx_t *) data;
+    switch (action) {
+    case EC20_LEX_SET_COPYING_MODE_ACTION:
+        ctx->mode = EC20_LEX_COPYING_MODE;
+        ctx->dptr = 0;
+      break;
+    case EC20_LEX_APPEND_ACTION:
+      ctx->buf[ctx->bptr ++] = ctx->input;
+      break;
+    case EC20_LEX_CR_ACTION:
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_CR_EVENT, NULL);
+      break;
+    case EC20_LEX_LF_ACTION:
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_LF_EVENT, NULL);
+      break;
+    case EC20_LEX_EOF_ACTION:
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_EOF_EVENT, NULL);
+      break;
+    case EC20_LEX_DECIMAL_ACTION:
+    case EC20_LEX_DECIMAL_NEWLINE_APPEND_ACTION:
+    case EC20_LEX_DECIMAL_NEWLINE_CR_ACTION:
+    case EC20_LEX_DECIMAL_NEWLINE_LF_ACTION:
+    case EC20_LEX_DECIMAL_NEWLINE_EOF_ACTION:
+    case EC20_LEX_DECIMAL_NEWLINE_SET_COPYING_MODE_ACTION: {
+      uint32_t num = string_to_uint((char *)ctx->buf, ctx->bptr);
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_DECIMAL_EVENT, &num);
+      ec20_lex_clear_buffer(ctx);
+      switch(action) {
+      case EC20_LEX_DECIMAL_NEWLINE_APPEND_ACTION:
+        ctx->buf[ctx->bptr ++] = ctx->input;
+        break;
+      case EC20_LEX_DECIMAL_NEWLINE_CR_ACTION:
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_CR_EVENT, NULL);
+        break;
+      case EC20_LEX_DECIMAL_NEWLINE_LF_ACTION:
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_LF_EVENT, NULL);
+        break;
+      case EC20_LEX_DECIMAL_NEWLINE_EOF_ACTION:
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_EOF_EVENT, NULL);
+        break;
+      case EC20_LEX_DECIMAL_NEWLINE_SET_COPYING_MODE_ACTION:
+        ctx->mode = EC20_LEX_COPYING_MODE;
+        ctx->dptr = 0;
+        break;
+      default:
+        break;
+      }
+      break;
+    }
+    case EC20_LEX_STRING_ACTION:
+    case EC20_LEX_STRING_NEWLINE_EOF_ACTION:
+    case EC20_LEX_STRING_NEWLINE_SET_COPYING_MODE_ACTION: {
+      void * tmp[2];
+      tmp[0] = ctx->buf;
+      tmp[1] = (uint16_t *) &ctx->bptr;
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_STRING_EVENT, tmp);
+      ec20_lex_clear_buffer(ctx);
+      switch (action) {
+      case EC20_LEX_STRING_NEWLINE_EOF_ACTION:
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_EOF_EVENT, NULL);
+        break;
+      case EC20_LEX_STRING_NEWLINE_SET_COPYING_MODE_ACTION:
+        ctx->mode = EC20_LEX_COPYING_MODE;
+        ctx->dptr = 0;
+        break;
+      default:
+        break;
+      }
+      break;
+    }
+    case EC20_LEX_TOKEN_ACTION:
+    case EC20_LEX_TOKEN_NEWLINE_CR_ACTION:
+    case EC20_LEX_TOKEN_NEWLINE_LF_ACTION:
+    case EC20_LEX_TOKEN_NEWLINE_EOF_ACTION:
+    case EC20_LEX_TOKEN_NEWLINE_SET_COPYING_MODE_ACTION: {
+      void * tmp[2];
+      tmp[0] = ctx->buf;
+      tmp[1] = (uint16_t *) &ctx->bptr;
+      /*
+      output_uint32(ec20_lex_state);
+      output_string(" ");
+      output_string("token is ");
+      for (uint8_t i = 0; i < ctx->bptr; i ++) {
+        output_char(ctx->buf[i]);
+      }
+      */
+      output_newline();
+      if (ctx->bptr == 6 &&
+          ctx->buf[0] == '+' &&
+          ctx->buf[1] == 'Q' &&
+          ctx->buf[2] == 'I' &&
+          ctx->buf[3] == 'U' &&
+          ctx->buf[4] == 'R' &&
+          ctx->buf[5] == 'C') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_QIURC_EVENT, NULL);
+      } else if (ctx->bptr == 3 &&
+          ctx->buf[0] == 'R' &&
+          ctx->buf[1] == 'D' &&
+          ctx->buf[2] == 'Y') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_RDY_EVENT, NULL);
+      } else if (ctx->bptr == 2 &&
+                 ctx->buf[0] == 'O' &&
+                 ctx->buf[1] == 'K') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_OK_EVENT, NULL);
+      } else if (ctx->bptr == 5 &&
+                 ctx->buf[0] == 'E' &&
+                 ctx->buf[1] == 'R' &&
+                 ctx->buf[2] == 'R' &&
+                 ctx->buf[3] == 'O' &&
+                 ctx->buf[4] == 'R') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_ERROR_EVENT, NULL);
+      } else if (ctx->bptr == 5 &&
+                 ctx->buf[0] == 'R' &&
+                 ctx->buf[1] == 'E' &&
+                 ctx->buf[2] == 'A' &&
+                 ctx->buf[3] == 'D' &&
+                 ctx->buf[4] == 'Y') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_READY_EVENT, NULL);
+      } else if (ctx->bptr == 7 &&
+                 ctx->buf[0] == 'C' &&
+                 ctx->buf[1] == 'O' &&
+                 ctx->buf[2] == 'N' &&
+                 ctx->buf[3] == 'N' &&
+                 ctx->buf[4] == 'E' &&
+                 ctx->buf[5] == 'C' &&
+                 ctx->buf[6] == 'T') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_CONNECT_EVENT, NULL);
+      } else if (ctx->bptr == 6 &&
+                 ctx->buf[0] == '+' &&
+                 ctx->buf[1] == 'C' &&
+                 ctx->buf[2] == 'G' &&
+                 ctx->buf[3] == 'R' &&
+                 ctx->buf[4] == 'E' &&
+                 ctx->buf[5] == 'G') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CGREG_EVENT, NULL);
+      } else if (ctx->bptr == 4 &&
+                 ctx->buf[0] == '+' &&
+                 ctx->buf[1] == 'C' &&
+                 ctx->buf[2] == 'M' &&
+                 ctx->buf[3] == 'E') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CME_EVENT, NULL);
+      } else if (ctx->bptr == 5 &&
+                 ctx->buf[0] == '+' &&
+                 ctx->buf[1] == 'C' &&
+                 ctx->buf[2] == 'P' &&
+                 ctx->buf[3] == 'I' &&
+                 ctx->buf[4] == 'N') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CPIN_EVENT, NULL);
+      } else if (ctx->bptr == 5 &&
+                 ctx->buf[0] == '+' &&
+                 ctx->buf[1] == 'C' &&
+                 ctx->buf[2] == 'R' &&
+                 ctx->buf[3] == 'E' &&
+                 ctx->buf[4] == 'G') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CREG_EVENT, NULL);
+      } else if (ctx->bptr == 4 &&
+                 ctx->buf[0] == '+' &&
+                 ctx->buf[1] == 'C' &&
+                 ctx->buf[2] == 'S' &&
+                 ctx->buf[3] == 'Q') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_CSQ_EVENT, NULL);
+      } else if (ctx->bptr == 7 &&
+                 ctx->buf[0] == '+' &&
+                 ctx->buf[1] == 'Q' &&
+                 ctx->buf[2] == 'I' &&
+                 ctx->buf[3] == 'O' &&
+                 ctx->buf[4] == 'P' &&
+                 ctx->buf[5] == 'E' &&
+                 ctx->buf[6] == 'N') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_QIOPEN_EVENT, NULL);
+      } else if (ctx->bptr == 9 &&
+                 ctx->buf[0] == '+' &&
+                 ctx->buf[1] == 'Q' &&
+                 ctx->buf[2] == 'H' &&
+                 ctx->buf[3] == 'T' &&
+                 ctx->buf[4] == 'T' &&
+                 ctx->buf[5] == 'P' &&
+                 ctx->buf[6] == 'G' &&
+                 ctx->buf[7] == 'E' &&
+                 ctx->buf[8] == 'T') {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_PLUS_QHTTPGET_EVENT, NULL);
+      } else {
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_TOKEN_EVENT, tmp);
+      }
+      ec20_lex_clear_buffer(ctx);
+      switch (action ) {
+      case EC20_LEX_TOKEN_NEWLINE_CR_ACTION:
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_CR_EVENT, NULL);
+        break;
+      case EC20_LEX_TOKEN_NEWLINE_LF_ACTION:
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_LF_EVENT, NULL);
+        break;
+      case EC20_LEX_TOKEN_NEWLINE_EOF_ACTION:
+        ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_EOF_EVENT, NULL);
+        break;
+      case EC20_LEX_TOKEN_NEWLINE_SET_COPYING_MODE_ACTION:
+        ctx->mode = EC20_LEX_COPYING_MODE;
+        ctx->dptr = 0;
+        break;
+      default:
+        break;
+      }
+      break;
+    }
+    case EC20_LEX_COPY_ACTION:
+      ctx->data[ctx->dptr ++] = ctx->input;
+      break;
+    case EC20_LEX_DATA_NEWLINE_SET_PARSING_MODE_ACTION: {
+      void * tmp[2];
+      tmp[0] = ctx->data;
+      tmp[1] = (uint16_t *) &ctx->dptr;
+      ec20_lex_ctx.mode = EC20_LEX_PARSING_MODE;
+      ec20_syntax_state = ec20_syntax_transform_state(ec20_syntax_state, EC20_SYNTAX_DATA_EVENT, &tmp);
+      break;
+    }
+    }
+  }
+#+end_src
+** UDP接口
+*** UDP打开连接
+#+begin_src c :noweb-ref ec20-udp-open-prototype
+  uint8_t ec20_udp_open(char * host, uint16_t port, ec20_read_callback read_callback, ec20_error_callback error_callback);
+#+end_src
+#+begin_src c :noweb-ref ec20-udp-open
+  uint8_t ec20_udp_open(char * host, uint16_t port, ec20_read_callback read_callback, ec20_error_callback error_callback) {
+    for (uint8_t i = 1; i < 13; i ++) {
+      if (connections[i].used == 0) {
+        bzero(&connections[i], sizeof(struct ec20_context_t));
+        connections[i].used = 1;
+        connections[i].type = 1;
+        connections[i].host = host;
+        connections[i].port = port;
+        connections[i].read_callback = read_callback;
+        connections[i].error_callback = error_callback;
+        connections[i].state = ec20_udp_transform_state(EC20_UDP_READY_STATE, EC20_UDP_OPEN_EVENT, &i);
+        connections[i].qicsgp_retry = RETRY;
+        connections[i].qiact_retry = RETRY;
+        connections[i].qideact_retry = RETRY;
+        connections[i].qiopen_retry = RETRY;
+        return i;
+      }
+    }
+    return 0; // error
+  }
+#+end_src
+*** UDP发送数据
+#+begin_src c :noweb-ref ec20-udp-write-prototype
+  uint8_t ec20_udp_write(uint8_t conn, uint8_t * data, uint32_t len);
+#+end_src
+#+begin_src c :noweb-ref ec20-udp-write
+  uint8_t ec20_udp_write(uint8_t conn, uint8_t * data, uint32_t len) {
+    if (connections[conn].used == 1 && connections[conn].type == 1 && connections[conn].state == EC20_UDP_QIOPEN_OKAY_STATE) {
+      uint32_t base64_len = base64_encode_length(len);
+      uint8_t base64buf[base64_len];
+      base64_len = base64_encode(data, len, base64buf, base64_len);
+      if (base64_len == 0) return 0;
+      memcpy(connections[conn].data, base64buf, base64_len);
+      connections[conn].data_len = base64_len;
+      connections[conn].state = ec20_udp_transform_state(connections[conn].state, EC20_UDP_WRITE_EVENT, &conn);
+      return 1; // success
+    } else {
+      return 0; // error
+    }
+  }
+#+end_src
+*** UDP关闭连接
+#+begin_src c :noweb-ref ec20-udp-close-prototype
+  uint8_t ec20_udp_close(uint8_t conn);
+#+end_src
+#+begin_src c :noweb-ref ec20-udp-close
+  uint8_t ec20_udp_close(uint8_t conn) {
+    if (connections[conn].used == 1) {
+      connections[conn].state = ec20_udp_transform_state(connections[conn].state, EC20_UDP_CLOSE_EVENT, &conn);
+      connections[conn].used = 0;
+      return 1; // success
+    }
+    return 0; // error
+  }
+#+end_src
+** HTTP接口
+*** HTTP打开连接
+#+begin_src c :noweb-ref ec20-http-open-prototype
+  uint8_t ec20_http_open(void);
+#+end_src
+#+begin_src c :noweb-ref ec20-http-open
+  uint8_t ec20_http_open(void) {
+    for (uint8_t i = 13; i < 16; i ++) {
+      if (connections[i].used == 0) {
+        bzero(&connections[i], sizeof(struct ec20_context_t));
+        connections[i].used = 1;
+        connections[i].type = 2;
+        connections[i].state = ec20_http_transform_state(EC20_HTTP_READY_STATE, EC20_HTTP_OPEN_EVENT, &i);
+        connections[i].qicsgp_retry = RETRY;
+        connections[i].qiact_retry = RETRY;
+        connections[i].qideact_retry = RETRY;
+        return i;
+      }
+    }
+    return 0;
+  }
+#+end_src
+*** HTTP GET请求
+#+begin_src c :noweb-ref ec20-http-get-prototype
+  uint8_t ec20_http_get(uint8_t conn, char * url, struct http_header_t * headers, uint8_t headers_len, ec20_read_callback read_callback, ec20_error_callback error_callback);
+#+end_src
+#+begin_src c :noweb-ref ec20-http-get
+  uint8_t ec20_http_get(uint8_t conn, char * url, struct http_header_t * headers, uint8_t headers_len, ec20_read_callback read_callback, ec20_error_callback error_callback) {
+    if (connections[conn].used == 1 && connections[conn].state == EC20_HTTP_QHTTPURL_READY_STATE) {
+      connections[conn].url = url;
+      connections[conn].headers = headers;
+      connections[conn].headers_len = headers_len;
+      connections[conn].read_callback = read_callback;
+      connections[conn].error_callback = error_callback;
+      connections[conn].state = ec20_http_transform_state(connections[conn].state, EC20_HTTP_GET_EVENT, &conn);
+      return 1;
+    }
+    return 0; // error
+  }
+#+end_src
+*** HTTP关闭连接
+#+begin_src c :noweb-ref ec20-http-close-prototype
+  uint8_t ec20_http_close(uint8_t fd);
+#+end_src
+#+begin_src c :noweb-ref ec20-http-close
+  uint8_t ec20_http_close(uint8_t fd) {
+    if (connections[fd].used == 1) {
+      connections[fd].state = ec20_http_transform_state(connections[fd].state, EC20_HTTP_CLOSE_EVENT, &fd);
+      connections[fd].used = 0;
+      return 1;
+    }
+    return 0; // error
+  }
+#+end_src
+** 辅助方法
+*** ec20-cmd
+发送命令给 ec20 模块。该方法会自动在结尾时，发送 "\r\n" 给 ec20 模块。
+#+begin_src c :noweb-ref ec20-cmd
+  static uint8_t _ec20_cmd(uint8_t conn, ...) {
+    uint32_t total = 0;
+    char * str = NULL;
+    va_list argptr;
+    va_start(argptr, conn);
+    do {
+      str = va_arg(argptr, char *);
+      if (str) {
+        total += strlen(str);
+      }
+    } while (str != NULL);
+    va_end(argptr);
+    total += 1; // reversed for '\r'
+
+    uint8_t size = 0;
+
+    if (total < 128) {
+      size = 1;
+    } else if (total < 16384) {
+      size = 2;
+    } else if (total < 2097152) {
+      size = 3;
+    } else {
+      size = 4;
+    }
+    if (1 + total + size <= ring_available(&ec20_tx)) {
+      ring_write(&ec20_tx, conn);
+      while (total > 0x7F) {
+        ring_write(&ec20_tx, (total & 0x7F) | 0x80);
+        total >>= 7;
+      }
+      ring_write(&ec20_tx, total);
+
+      va_start(argptr, conn);
+      do {
+        str = va_arg(argptr, char *);
+        if (str) {
+          ring_write_array(&ec20_tx, (uint8_t *)str, 0, strlen(str));
+          output_string(str);
+        }
+      } while (str != NULL);
+      va_end(argptr);
+      ring_write_array(&ec20_tx, (uint8_t *)"\r", 0, 1);
+      output_newline();
+      return 1;
+    } else {
+      return 0;
+    }
+  }
+
+  #define ec20_cmd(...) _ec20_cmd(__VA_ARGS__, NULL)
+#+end_src
+*** ec20-str
+发送字符串数据给 ec20 模块。
+#+begin_src c :noweb-ref ec20-str
+  static uint8_t _ec20_str(uint8_t conn, ...) {
+    uint32_t total = 0;
+    char * str = NULL;
+    va_list argptr;
+    va_start(argptr, conn);
+    do {
+      str = va_arg(argptr, char *);
+      if (str) {
+        total += strlen(str);
+      }
+    } while (str != NULL);
+    va_end(argptr);
+
+    uint8_t size = 0;
+
+    if (total < 128) {
+      size = 1;
+    } else if (total < 16384) {
+      size = 2;
+    } else if (total < 2097152) {
+      size = 3;
+    } else {
+      size = 4;
+    }
+    if (1 + total + size <= ring_available(&ec20_tx)) {
+      ring_write(&ec20_tx, conn);
+      while (total > 0x7F) {
+        ring_write(&ec20_tx, (total & 0x7F) | 0x80);
+        total >>= 7;
+      }
+      ring_write(&ec20_tx, total);
+
+      va_start(argptr, conn);
+      do {
+        str = va_arg(argptr, char *);
+        if (str) {
+          ring_write_array(&ec20_tx, (uint8_t *)str, 0, strlen(str));
+          output_string(str);
+        }
+      } while (str != NULL);
+      va_end(argptr);
+      output_newline();
+      return 1;
+    } else {
+      return 0;
+    }
+  }
+
+  #define ec20_str(...) _ec20_str(__VA_ARGS__, NULL)
+#+end_src
